@@ -106,7 +106,7 @@ func TestClaimDecisionDBClaimedRuntimePoll(t *testing.T) {
 	if claimed == nil {
 		t.Fatal("ClaimTaskForRuntime returned nil, want the queued task")
 	}
-	if got := claimDecisionCount(t, f.metrics, claimSourceRuntime, claimOutcomeClaimed, claimReasonClaimed); got != 1 {
+	if got := claimDecisionCount(t, f.metrics, claimPathRuntime, claimOutcomeClaimed, claimReasonClaimed); got != 1 {
 		t.Fatalf("claim_decision_total{runtime,claimed,claimed} = %v, want 1", got)
 	}
 }
@@ -125,24 +125,27 @@ func TestClaimDecisionDBNoCapacity(t *testing.T) {
 	if claimed != nil {
 		t.Fatalf("ClaimTaskForRuntime claimed %s, want nil", util.UUIDToString(claimed.ID))
 	}
-	if got := claimDecisionCount(t, f.metrics, claimSourceRuntime, claimOutcomeNoCapacity, claimReasonAgentConcurrencyCap); got != 1 {
+	if got := claimDecisionCount(t, f.metrics, claimPathRuntime, claimOutcomeNoCapacity, claimReasonAgentConcurrencyCap); got != 1 {
 		t.Fatalf("claim_decision_total{runtime,no_capacity,agent_concurrency_cap} = %v, want 1", got)
 	}
 }
 
-// TestClaimDecisionDBCandidatesBlocked is the core #8551 scenario: the queued
-// task stays visible to the candidate list, yet the claim still returns
-// nothing, so the wait belongs to a fence rather than to an empty queue.
+// TestClaimDecisionDBCandidatesUnclaimed is the core #8551 scenario: the
+// queued task stays visible to the candidate list, yet the claim still
+// returns nothing, so the wait belongs to an unclaimed-attempt rather than to
+// an empty candidate set.
 //
 // The fence exercised here is runtime liveness: the candidate query's
 // authorization fence checks binding and visibility but not liveness, while
 // ClaimAgentTask additionally requires r.status='online' with a fresh
 // heartbeat. Marking the runtime offline after enqueue therefore leaves the
 // candidate visible while the claim is rejected — outcome=no_tasks must be
-// attributed to candidates_blocked. The same collapse hides the other SQL
-// fences (wakeup gate, per-(issue, agent) serialization, rebind), which is
-// exactly the attribution gap this counter exists to close.
-func TestClaimDecisionDBCandidatesBlocked(t *testing.T) {
+// attributed to candidates_unclaimed (candidates observed, nothing claimed;
+// the exact cause is unknown from the Go side). The same collapse hides the
+// other SQL fences (wakeup gate, per-(issue, agent) serialization, rebind),
+// and a lost race against another claimer looks identical — which is why the
+// reason states only what the evidence supports.
+func TestClaimDecisionDBCandidatesUnclaimed(t *testing.T) {
 	f := newClaimDecisionFixture(t, 5)
 	f.insertTask(t, "queued")
 
@@ -159,17 +162,19 @@ func TestClaimDecisionDBCandidatesBlocked(t *testing.T) {
 	if claimed != nil {
 		t.Fatalf("ClaimTaskForRuntime claimed %s, want nil", util.UUIDToString(claimed.ID))
 	}
-	if got := claimDecisionCount(t, f.metrics, claimSourceRuntime, claimOutcomeNoTasks, claimReasonCandidatesBlocked); got != 1 {
-		t.Fatalf("claim_decision_total{runtime,no_tasks,candidates_blocked} = %v, want 1", got)
+	if got := claimDecisionCount(t, f.metrics, claimPathRuntime, claimOutcomeNoTasks, claimReasonCandidatesUnclaimed); got != 1 {
+		t.Fatalf("claim_decision_total{runtime,no_tasks,candidates_unclaimed} = %v, want 1", got)
 	}
-	if got := claimDecisionCount(t, f.metrics, claimSourceRuntime, claimOutcomeNoTasks, claimReasonNoCandidates); got != 0 {
-		t.Fatalf("claim_decision_total{runtime,no_tasks,no_candidates} = %v, want 0", got)
+	if got := claimDecisionCount(t, f.metrics, claimPathRuntime, claimOutcomeNoTasks, claimReasonNoVisibleCandidates); got != 0 {
+		t.Fatalf("claim_decision_total{runtime,no_tasks,no_visible_candidates} = %v, want 0", got)
 	}
 }
 
-// TestClaimDecisionDBEmptyQueue covers the idle poll: no tasks at all produce
-// outcome=empty_db (reason empty_queue) from the poll-level exit that never
-// enters claimTask.
+// TestClaimDecisionDBEmptyQueue covers the idle poll: no candidates at all
+// produce outcome=empty_db (reason no_visible_candidates) from the poll-level
+// exit that never enters claimTask. The candidate query already filters
+// wakeup validity and agent/runtime binding, so the reason states only that
+// nothing was visible — not that the queue holds no tasks.
 func TestClaimDecisionDBEmptyQueue(t *testing.T) {
 	f := newClaimDecisionFixture(t, 5)
 
@@ -180,7 +185,70 @@ func TestClaimDecisionDBEmptyQueue(t *testing.T) {
 	if claimed != nil {
 		t.Fatalf("ClaimTaskForRuntime claimed %s, want nil", util.UUIDToString(claimed.ID))
 	}
-	if got := claimDecisionCount(t, f.metrics, claimSourceRuntime, claimOutcomeEmptyDB, claimReasonEmptyQueue); got != 1 {
-		t.Fatalf("claim_decision_total{runtime,empty_db,empty_queue} = %v, want 1", got)
+	if got := claimDecisionCount(t, f.metrics, claimPathRuntime, claimOutcomeEmptyDB, claimReasonNoVisibleCandidates); got != 1 {
+		t.Fatalf("claim_decision_total{runtime,empty_db,no_visible_candidates} = %v, want 1", got)
+	}
+}
+
+// TestClaimDecisionDBBatchClaimed covers the batch poll's happy path: one
+// queued task claimed through ClaimTasksForRuntimes increments the
+// (batch, claimed, claimed) series once via claimTask's defer.
+func TestClaimDecisionDBBatchClaimed(t *testing.T) {
+	f := newClaimDecisionFixture(t, 5)
+	f.insertTask(t, "queued")
+
+	claimed, err := f.svc.ClaimTasksForRuntimes(context.Background(), []pgtype.UUID{f.runtimeID}, 8)
+	if err != nil {
+		t.Fatalf("ClaimTasksForRuntimes: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("ClaimTasksForRuntimes claimed %d tasks, want 1", len(claimed))
+	}
+	if got := claimDecisionCount(t, f.metrics, claimPathBatch, claimOutcomeClaimed, claimReasonClaimed); got != 1 {
+		t.Fatalf("claim_decision_total{batch,claimed,claimed} = %v, want 1", got)
+	}
+}
+
+// TestClaimDecisionDBBatchNoVisibleCandidates covers the batch poll's idle
+// exit: the candidate query returns nothing, so the poll records
+// (batch, empty_db, no_visible_candidates) without ever entering claimTask.
+func TestClaimDecisionDBBatchNoVisibleCandidates(t *testing.T) {
+	f := newClaimDecisionFixture(t, 5)
+
+	claimed, err := f.svc.ClaimTasksForRuntimes(context.Background(), []pgtype.UUID{f.runtimeID}, 8)
+	if err != nil {
+		t.Fatalf("ClaimTasksForRuntimes: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("ClaimTasksForRuntimes claimed %d tasks, want 0", len(claimed))
+	}
+	if got := claimDecisionCount(t, f.metrics, claimPathBatch, claimOutcomeEmptyDB, claimReasonNoVisibleCandidates); got != 1 {
+		t.Fatalf("claim_decision_total{batch,empty_db,no_visible_candidates} = %v, want 1", got)
+	}
+}
+
+// TestClaimDecisionDBBatchCandidatesUnclaimed mirrors the singular-path
+// unclaimed scenario through the batch poll: the runtime goes offline after
+// enqueue, the candidate stays visible, and the claim attempt records
+// (batch, no_tasks, candidates_unclaimed).
+func TestClaimDecisionDBBatchCandidatesUnclaimed(t *testing.T) {
+	f := newClaimDecisionFixture(t, 5)
+	f.insertTask(t, "queued")
+
+	if _, err := f.pool.Exec(context.Background(),
+		`UPDATE agent_runtime SET status = 'offline' WHERE id = $1`, f.runtimeID,
+	); err != nil {
+		t.Fatalf("take runtime offline: %v", err)
+	}
+
+	claimed, err := f.svc.ClaimTasksForRuntimes(context.Background(), []pgtype.UUID{f.runtimeID}, 8)
+	if err != nil {
+		t.Fatalf("ClaimTasksForRuntimes: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("ClaimTasksForRuntimes claimed %d tasks, want 0", len(claimed))
+	}
+	if got := claimDecisionCount(t, f.metrics, claimPathBatch, claimOutcomeNoTasks, claimReasonCandidatesUnclaimed); got != 1 {
+		t.Fatalf("claim_decision_total{batch,no_tasks,candidates_unclaimed} = %v, want 1", got)
 	}
 }

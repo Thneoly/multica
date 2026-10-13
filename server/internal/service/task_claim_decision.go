@@ -19,12 +19,23 @@ import (
 // serialization, rebind fence) into one value even though the caller's
 // candidate list knew whether work was visible at all.
 //
-// recordClaimDecision below is the single funnel for this: one call per claim
-// attempt (from claimTask's defer) and one per claim-poll exit that never
-// reaches claimTask. It emits a bounded-cardinality counter
-// (source x outcome x reason) and a structured debug log. Nothing here changes
-// any decision — the outcomes mirror strings the claim paths already produce,
-// and the mapping is pure.
+// recordClaimDecision below is the single funnel for this. Counting unit: one
+// increment per claim attempt (one claimTask call, from its defer) plus one
+// per poll-level decision that never enters claimTask — a poll
+// short-circuiting on the empty cache, a poll whose candidate query returns
+// nothing claimable, each recovered stale-dispatched task, and each poll-level
+// error exit. Poll decisions and claim attempts are distinct outcomes, so the
+// two layers cannot double-count the same decision. Nothing here changes any
+// decision — the outcomes mirror strings the claim paths already produce, and
+// the mapping is pure.
+//
+// Reason semantics are deliberately evidence-bounded. The candidate queries
+// already filter on wakeup validity and agent/runtime binding, so an empty
+// result only proves no *visible* candidates — never that the queue holds no
+// tasks (reason: no_visible_candidates). Conversely, candidates observed with
+// a no_tasks outcome proves only that no task was claimed on this attempt —
+// the exact cause (a SQL fence versus another request winning the row) is
+// unknown (reason: candidates_unclaimed).
 
 // Outcomes produced inside claimTask, shared by every caller.
 const (
@@ -40,9 +51,10 @@ const (
 	claimOutcomeErrorTransaction       = "error_transaction"
 )
 
-// Outcomes of the single-runtime claim poll (ClaimTaskForRuntime) that return
-// before claimTask is ever entered. claimOutcomeNoTask is that function's
-// initial slow-log outcome; no funnel call records it.
+// Outcomes of claim polls (ClaimTaskForRuntime and the batch
+// ClaimTasksForRuntimes) that return before claimTask is ever entered, plus
+// stale-dispatch recovery. claimOutcomeNoTask is ClaimTaskForRuntime's initial
+// slow-log outcome; no funnel call records it.
 const (
 	claimOutcomeNoTask                 = "no_task"
 	claimOutcomeEmptyCacheHit          = "empty_cache_hit"
@@ -54,36 +66,41 @@ const (
 )
 
 // Reasons narrow an outcome into the cause a dashboard or debug-log reader
-// cares about. The candidates_blocked vs no_candidates split is the #8551
-// signal: the runtime saw queued work, yet the SQL claim still returned
-// nothing — so the wait belongs to a fence, not to an empty queue.
+// cares about, stating only what the evidence supports. The
+// candidates_unclaimed vs no_visible_candidates split inside no_tasks is the
+// #8551 signal: the former says work was visible yet nothing was claimed on
+// this attempt (cause unknown — fence or lost race), the latter says the
+// candidate query itself saw nothing claimable.
 const (
-	claimReasonClaimed                = "claimed"
-	claimReasonNoCandidates           = "no_candidates"
-	claimReasonCandidatesBlocked      = "candidates_blocked"
-	claimReasonUnknownCandidates      = "unknown_candidates"
-	claimReasonAgentConcurrencyCap    = "agent_concurrency_cap"
-	claimReasonAgentUnbound           = "agent_unbound"
-	claimReasonAgentRebound           = "agent_rebound"
-	claimReasonEmptyCache             = "empty_cache"
-	claimReasonEmptyQueue             = "empty_queue"
-	claimReasonStaleDispatchRecovered = "stale_dispatch_recovered"
-	claimReasonError                  = "error"
+	claimReasonClaimed              = "claimed"
+	claimReasonNoVisibleCandidates  = "no_visible_candidates"
+	claimReasonCandidatesUnclaimed  = "candidates_unclaimed"
+	claimReasonUnknownCandidates    = "unknown_candidates"
+	claimReasonAgentConcurrencyCap  = "agent_concurrency_cap"
+	claimReasonAgentUnbound         = "agent_unbound"
+	claimReasonAgentRebound         = "agent_rebound"
+	claimReasonEmptyCache           = "empty_cache"
+	claimReasonStaleDispatchRecover = "stale_dispatch_recovered"
+	claimReasonError                = "error"
 )
 
-// Claim poll paths, as seen by the counter's source label.
+// Claim poll paths, as seen by the counter's claim_path label. Distinct from
+// the task-origin `source` label used by the other multica_agent_task_*
+// metrics: those classify where a task came from (issue, chat, autopilot),
+// while this classifies which poll path made the decision.
 const (
-	claimSourceAgent   = "agent"   // ClaimTask (agent-triggered claim)
-	claimSourceRuntime = "runtime" // ClaimTaskForRuntime (single-runtime poll)
-	claimSourceBatch   = "batch"   // ClaimTasksForRuntimes (machine-level batch)
+	claimPathAgent   = "agent"   // ClaimTask (agent-triggered claim)
+	claimPathRuntime = "runtime" // ClaimTaskForRuntime (single-runtime poll)
+	claimPathBatch   = "batch"   // ClaimTasksForRuntimes (machine-level batch)
 )
 
 // claimScope is informational context the caller already holds. candidates is
 // how many rows in the caller's candidate list belong to the agent being
 // claimed; the agent path has no list, so it reports zero and its no_tasks
-// outcome maps to unknown_candidates rather than a definitive no_candidates.
+// outcome maps to unknown_candidates rather than a definitive
+// no_visible_candidates.
 type claimScope struct {
-	source     string
+	claimPath  string
 	candidates int
 }
 
@@ -101,12 +118,12 @@ func claimReasonFor(outcome string, scope claimScope) string {
 	switch outcome {
 	case claimOutcomeNoTasks:
 		if scope.candidates > 0 {
-			return claimReasonCandidatesBlocked
+			return claimReasonCandidatesUnclaimed
 		}
-		if scope.source == claimSourceAgent {
+		if scope.claimPath == claimPathAgent {
 			return claimReasonUnknownCandidates
 		}
-		return claimReasonNoCandidates
+		return claimReasonNoVisibleCandidates
 	case claimOutcomeNoCapacity:
 		return claimReasonAgentConcurrencyCap
 	case claimOutcomeRuntimeMismatch:
@@ -118,21 +135,21 @@ func claimReasonFor(outcome string, scope claimScope) string {
 	case claimOutcomeEmptyCacheHit:
 		return claimReasonEmptyCache
 	case claimOutcomeEmptyDB:
-		return claimReasonEmptyQueue
+		return claimReasonNoVisibleCandidates
 	case claimOutcomeReclaimedDispatched:
-		return claimReasonStaleDispatchRecovered
+		return claimReasonStaleDispatchRecover
 	default:
 		// Every error_* outcome, and anything unrecognized.
 		return claimReasonError
 	}
 }
 
-// normalizeClaimSource keeps the counter's source label a closed enum: values
-// outside the three known poll paths land on "other".
-func normalizeClaimSource(source string) string {
-	switch source {
-	case claimSourceAgent, claimSourceRuntime, claimSourceBatch:
-		return source
+// normalizeClaimPath keeps the counter's claim_path label a closed enum:
+// values outside the three known poll paths land on "other".
+func normalizeClaimPath(claimPath string) string {
+	switch claimPath {
+	case claimPathAgent, claimPathRuntime, claimPathBatch:
+		return claimPath
 	default:
 		return "other"
 	}
@@ -143,14 +160,14 @@ func normalizeClaimSource(source string) string {
 // runtimeID may be the zero UUID (the agent path passes no runtime).
 //
 // The empty-poll outcomes (empty_cache_hit, empty_db) fire on every idle
-// runtime poll — the hottest path in the scheduler — so they are counted but
+// poll — the hottest path in the scheduler — so they are counted but
 // deliberately not logged; a debug line per idle poll would flood any
 // deployment running with debug logging enabled.
 func (s *TaskService) recordClaimDecision(agentID, runtimeID pgtype.UUID, outcome string, scope claimScope, detail claimDecisionDetail) {
-	scope.source = normalizeClaimSource(scope.source)
+	scope.claimPath = normalizeClaimPath(scope.claimPath)
 	reason := claimReasonFor(outcome, scope)
 	if s.Metrics != nil {
-		s.Metrics.RecordClaimDecision(scope.source, outcome, reason)
+		s.Metrics.RecordClaimDecision(scope.claimPath, outcome, reason)
 	}
 	if outcome == claimOutcomeEmptyCacheHit || outcome == claimOutcomeEmptyDB {
 		return
@@ -158,7 +175,7 @@ func (s *TaskService) recordClaimDecision(agentID, runtimeID pgtype.UUID, outcom
 	attrs := []any{
 		"outcome", outcome,
 		"reason", reason,
-		"source", scope.source,
+		"claim_path", scope.claimPath,
 		"agent_id", util.UUIDToString(agentID),
 		"runtime_id", util.UUIDToString(runtimeID),
 		"candidates", scope.candidates,

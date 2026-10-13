@@ -3500,7 +3500,7 @@ func (s *TaskService) broadcastChatCancelFinalized(ctx context.Context, task db.
 // ClaimTask atomically claims the next queued task for an agent on its current
 // runtime, respecting max_concurrent_tasks.
 func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.AgentTaskQueue, error) {
-	return s.claimTask(ctx, agentID, pgtype.UUID{}, claimScope{source: claimSourceAgent})
+	return s.claimTask(ctx, agentID, pgtype.UUID{}, claimScope{claimPath: claimPathAgent})
 }
 
 // claimTask is the runtime-scoped claim primitive used by daemon poll paths.
@@ -3669,7 +3669,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	runtimeKey := util.UUIDToString(runtimeID)
 	if err := s.PromoteDueDeferredTasksForRuntime(ctx, runtimeID); err != nil {
 		outcome = "error_promote_deferred"
-		s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{source: claimSourceRuntime}, claimDecisionDetail{})
+		s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{claimPath: claimPathRuntime}, claimDecisionDetail{})
 		return nil, err
 	}
 
@@ -3694,7 +3694,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 			)
 			s.trackTaskForReclaim(stale, reclaimCheckAfter)
 			outcome = "reclaimed_dispatched"
-			s.recordClaimDecision(stale.AgentID, runtimeID, outcome, claimScope{source: claimSourceRuntime}, claimDecisionDetail{})
+			s.recordClaimDecision(stale.AgentID, runtimeID, outcome, claimScope{claimPath: claimPathRuntime}, claimDecisionDetail{})
 			claimedFlag = true
 			slog.Info("stale dispatched task reclaimed",
 				"task_id", util.UUIDToString(stale.ID),
@@ -3705,7 +3705,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			outcome = "error_reclaim_dispatched"
-			s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{source: claimSourceRuntime}, claimDecisionDetail{})
+			s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{claimPath: claimPathRuntime}, claimDecisionDetail{})
 			return nil, fmt.Errorf("reclaim stale dispatched task: %w", err)
 		}
 		s.ReclaimCheck.MarkChecked(
@@ -3718,7 +3718,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 
 	if s.EmptyClaim.IsEmpty(ctx, runtimeKey) {
 		outcome = "empty_cache_hit"
-		s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{source: claimSourceRuntime}, claimDecisionDetail{})
+		s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{claimPath: claimPathRuntime}, claimDecisionDetail{})
 		return nil, nil
 	}
 
@@ -3736,14 +3736,14 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	listCount = len(tasks)
 	if err != nil {
 		outcome = "error_list"
-		s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{source: claimSourceRuntime}, claimDecisionDetail{})
+		s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{claimPath: claimPathRuntime}, claimDecisionDetail{})
 		return nil, fmt.Errorf("list queued claim candidates: %w", err)
 	}
 
 	if len(tasks) == 0 {
 		s.EmptyClaim.MarkEmpty(ctx, runtimeKey, preSelectVersion)
 		outcome = "empty_db"
-		s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{source: claimSourceRuntime}, claimDecisionDetail{})
+		s.recordClaimDecision(pgtype.UUID{}, runtimeID, outcome, claimScope{claimPath: claimPathRuntime}, claimDecisionDetail{})
 		return nil, nil
 	}
 
@@ -3766,7 +3766,7 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		tried++
 
 		task, err := s.claimTask(ctx, candidate.AgentID, runtimeID, claimScope{
-			source:     claimSourceRuntime,
+			claimPath:  claimPathRuntime,
 			candidates: candidatesByAgent[agentKey],
 		})
 		if err != nil {
@@ -3994,6 +3994,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		slog.Info("promote deferred tasks (batch): slot taken by a concurrent enqueue, skipping this tick")
 		promoted = nil
 	} else if err != nil {
+		s.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, "error_promote_deferred", claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
 		return nil, fmt.Errorf("promote deferred tasks: %w", err)
 	}
 	for _, task := range promoted {
@@ -4029,6 +4030,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 			MaxTasks:          int32(maxTasks),
 		})
 		if err != nil {
+			s.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, "error_reclaim_dispatched", claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
 			return nil, fmt.Errorf("reclaim stale dispatched tasks: %w", err)
 		}
 		// The UPDATE's fixed setup/locking cost dominates array width. Query and
@@ -4044,6 +4046,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	for i := range reclaimed {
 		s.trackTaskForReclaim(reclaimed[i], reclaimCheckAfter)
 		claimed = append(claimed, reclaimed[i])
+		s.recordClaimDecision(reclaimed[i].AgentID, reclaimed[i].RuntimeID, "reclaimed_dispatched", claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
 		slog.Info("stale dispatched task reclaimed (batch)",
 			"task_id", util.UUIDToString(reclaimed[i].ID),
 			"runtime_id", util.UUIDToString(reclaimed[i].RuntimeID),
@@ -4066,6 +4069,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		nonEmpty = append(nonEmpty, rid)
 	}
 	if len(nonEmpty) == 0 {
+		s.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, "empty_cache_hit", claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
 		slog.Debug("batch claim: all runtimes empty-cached", "runtimes", len(uniqueIDs))
 		return claimed, nil
 	}
@@ -4073,6 +4077,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	// 4. One candidate SELECT across the non-empty set.
 	candidates, err := s.Queries.ListQueuedClaimCandidatesByRuntimes(ctx, nonEmpty)
 	if err != nil {
+		s.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, "error_list", claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
 		// Steps 2/6 commit reclaimed/claimed tasks in their own transactions,
 		// so `claimed` may already hold tasks dispatched server-side. Dropping
 		// them with a 500 makes the daemon HTTP-fall-back and claim a SECOND
@@ -4103,6 +4108,14 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 			s.EmptyClaim.MarkEmpty(ctx, key, versions[key])
 		}
 	}
+	if len(candidates) == 0 {
+		// Poll-level decision: the candidate query saw nothing claimable for
+		// any runtime in the batch (it already filters wakeup validity and
+		// agent/runtime binding, so this is about visible candidates, not
+		// about the queue being empty).
+		s.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, "empty_db", claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
+		return claimed, nil
+	}
 
 	// 6. Claim per distinct agent through the runtime-scoped helper, preserving
 	// per-(issue, agent) serialization, capacity caps, and dispatch side effects.
@@ -4128,7 +4141,7 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		triedAgents[agentKey] = struct{}{}
 
 		task, err := s.claimTask(ctx, candidates[i].AgentID, candidates[i].RuntimeID, claimScope{
-			source:     claimSourceBatch,
+			claimPath:  claimPathBatch,
 			candidates: candidatesByAgent[agentKey],
 		})
 		if err != nil {

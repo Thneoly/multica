@@ -8,14 +8,14 @@ import (
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 )
 
-// This runs without a database: claimReasonFor, normalizeClaimSource, and the
+// This runs without a database: claimReasonFor, normalizeClaimPath, and the
 // metric funnel are pure functions over their arguments.
 
 // TestClaimDecisionReasonFor pins the outcome -> reason mapping, especially
-// the #8551 split inside no_tasks: candidates > 0 means work was visible and a
-// SQL fence rejected it, zero candidates on a list-bearing path means the
-// queue really was empty, and the list-less agent path can only report
-// "unknown".
+// the #8551 split inside no_tasks: candidates > 0 means work was visible and
+// nothing was claimed on this attempt (exact cause unknown), zero candidates
+// on a list-bearing path means the candidate query saw nothing claimable, and
+// the list-less agent path can only report "unknown".
 func TestClaimDecisionReasonFor(t *testing.T) {
 	t.Parallel()
 
@@ -25,35 +25,36 @@ func TestClaimDecisionReasonFor(t *testing.T) {
 		scope   claimScope
 		want    string
 	}{
-		{name: "claimed stays claimed", outcome: claimOutcomeClaimed, scope: claimScope{source: claimSourceAgent}, want: claimReasonClaimed},
-		{name: "claimed via runtime poll", outcome: claimOutcomeClaimed, scope: claimScope{source: claimSourceRuntime, candidates: 3}, want: claimReasonClaimed},
-		{name: "no capacity maps to concurrency cap", outcome: claimOutcomeNoCapacity, scope: claimScope{source: claimSourceRuntime}, want: claimReasonAgentConcurrencyCap},
-		{name: "no runtime maps to unbound agent", outcome: claimOutcomeNoRuntime, scope: claimScope{source: claimSourceAgent}, want: claimReasonAgentUnbound},
-		{name: "runtime mismatch maps to rebound agent", outcome: claimOutcomeRuntimeMismatch, scope: claimScope{source: claimSourceRuntime}, want: claimReasonAgentRebound},
+		{name: "claimed stays claimed", outcome: claimOutcomeClaimed, scope: claimScope{claimPath: claimPathAgent}, want: claimReasonClaimed},
+		{name: "claimed via runtime poll", outcome: claimOutcomeClaimed, scope: claimScope{claimPath: claimPathRuntime, candidates: 3}, want: claimReasonClaimed},
+		{name: "no capacity maps to concurrency cap", outcome: claimOutcomeNoCapacity, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonAgentConcurrencyCap},
+		{name: "no runtime maps to unbound agent", outcome: claimOutcomeNoRuntime, scope: claimScope{claimPath: claimPathAgent}, want: claimReasonAgentUnbound},
+		{name: "runtime mismatch maps to rebound agent", outcome: claimOutcomeRuntimeMismatch, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonAgentRebound},
 
-		{name: "no tasks with candidates is blocked", outcome: claimOutcomeNoTasks, scope: claimScope{source: claimSourceRuntime, candidates: 1}, want: claimReasonCandidatesBlocked},
-		{name: "no tasks blocked on batch path", outcome: claimOutcomeNoTasks, scope: claimScope{source: claimSourceBatch, candidates: 2}, want: claimReasonCandidatesBlocked},
-		{name: "no tasks without candidates is empty queue", outcome: claimOutcomeNoTasks, scope: claimScope{source: claimSourceRuntime}, want: claimReasonNoCandidates},
-		{name: "no tasks without candidates on batch", outcome: claimOutcomeNoTasks, scope: claimScope{source: claimSourceBatch}, want: claimReasonNoCandidates},
-		{name: "no tasks on agent path is unknown", outcome: claimOutcomeNoTasks, scope: claimScope{source: claimSourceAgent}, want: claimReasonUnknownCandidates},
-		{name: "agent path with candidates is still blocked", outcome: claimOutcomeNoTasks, scope: claimScope{source: claimSourceAgent, candidates: 1}, want: claimReasonCandidatesBlocked},
+		{name: "no tasks with candidates is unclaimed", outcome: claimOutcomeNoTasks, scope: claimScope{claimPath: claimPathRuntime, candidates: 1}, want: claimReasonCandidatesUnclaimed},
+		{name: "no tasks unclaimed on batch path", outcome: claimOutcomeNoTasks, scope: claimScope{claimPath: claimPathBatch, candidates: 2}, want: claimReasonCandidatesUnclaimed},
+		{name: "no tasks without candidates is nothing visible", outcome: claimOutcomeNoTasks, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonNoVisibleCandidates},
+		{name: "no tasks without candidates on batch", outcome: claimOutcomeNoTasks, scope: claimScope{claimPath: claimPathBatch}, want: claimReasonNoVisibleCandidates},
+		{name: "no tasks on agent path is unknown", outcome: claimOutcomeNoTasks, scope: claimScope{claimPath: claimPathAgent}, want: claimReasonUnknownCandidates},
+		{name: "agent path with candidates is still unclaimed", outcome: claimOutcomeNoTasks, scope: claimScope{claimPath: claimPathAgent, candidates: 1}, want: claimReasonCandidatesUnclaimed},
 
-		{name: "empty cache hit", outcome: claimOutcomeEmptyCacheHit, scope: claimScope{source: claimSourceRuntime}, want: claimReasonEmptyCache},
-		{name: "empty db", outcome: claimOutcomeEmptyDB, scope: claimScope{source: claimSourceRuntime}, want: claimReasonEmptyQueue},
-		{name: "reclaimed dispatch", outcome: claimOutcomeReclaimedDispatched, scope: claimScope{source: claimSourceRuntime}, want: claimReasonStaleDispatchRecovered},
+		{name: "empty cache hit", outcome: claimOutcomeEmptyCacheHit, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonEmptyCache},
+		{name: "empty db means nothing visible", outcome: claimOutcomeEmptyDB, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonNoVisibleCandidates},
+		{name: "empty db on batch means nothing visible", outcome: claimOutcomeEmptyDB, scope: claimScope{claimPath: claimPathBatch}, want: claimReasonNoVisibleCandidates},
+		{name: "reclaimed dispatch", outcome: claimOutcomeReclaimedDispatched, scope: claimScope{claimPath: claimPathBatch}, want: claimReasonStaleDispatchRecover},
 
-		{name: "error get agent", outcome: claimOutcomeErrorGetAgent, scope: claimScope{source: claimSourceAgent}, want: claimReasonError},
-		{name: "error count running", outcome: claimOutcomeErrorCountRunning, scope: claimScope{source: claimSourceRuntime}, want: claimReasonError},
-		{name: "error claim", outcome: claimOutcomeErrorClaim, scope: claimScope{source: claimSourceRuntime}, want: claimReasonError},
-		{name: "error reanchor chat input", outcome: claimOutcomeErrorReanchorChatInput, scope: claimScope{source: claimSourceRuntime}, want: claimReasonError},
-		{name: "error transaction", outcome: claimOutcomeErrorTransaction, scope: claimScope{source: claimSourceBatch}, want: claimReasonError},
-		{name: "error promote deferred", outcome: claimOutcomeErrorPromoteDeferred, scope: claimScope{source: claimSourceRuntime}, want: claimReasonError},
-		{name: "error reclaim dispatched", outcome: claimOutcomeErrorReclaimDispatched, scope: claimScope{source: claimSourceRuntime}, want: claimReasonError},
-		{name: "error list", outcome: claimOutcomeErrorList, scope: claimScope{source: claimSourceRuntime}, want: claimReasonError},
+		{name: "error get agent", outcome: claimOutcomeErrorGetAgent, scope: claimScope{claimPath: claimPathAgent}, want: claimReasonError},
+		{name: "error count running", outcome: claimOutcomeErrorCountRunning, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonError},
+		{name: "error claim", outcome: claimOutcomeErrorClaim, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonError},
+		{name: "error reanchor chat input", outcome: claimOutcomeErrorReanchorChatInput, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonError},
+		{name: "error transaction", outcome: claimOutcomeErrorTransaction, scope: claimScope{claimPath: claimPathBatch}, want: claimReasonError},
+		{name: "error promote deferred", outcome: claimOutcomeErrorPromoteDeferred, scope: claimScope{claimPath: claimPathBatch}, want: claimReasonError},
+		{name: "error reclaim dispatched", outcome: claimOutcomeErrorReclaimDispatched, scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonError},
+		{name: "error list", outcome: claimOutcomeErrorList, scope: claimScope{claimPath: claimPathBatch}, want: claimReasonError},
 
 		// Unknown inputs degrade to "error" instead of minting a series.
-		{name: "unrecognized outcome", outcome: "no_task", scope: claimScope{source: claimSourceRuntime}, want: claimReasonError},
-		{name: "bogus outcome", outcome: "surprise", scope: claimScope{source: claimSourceAgent}, want: claimReasonError},
+		{name: "unrecognized outcome", outcome: "no_task", scope: claimScope{claimPath: claimPathRuntime}, want: claimReasonError},
+		{name: "bogus outcome", outcome: "surprise", scope: claimScope{claimPath: claimPathAgent}, want: claimReasonError},
 	}
 
 	for _, tt := range tests {
@@ -67,27 +68,27 @@ func TestClaimDecisionReasonFor(t *testing.T) {
 	}
 }
 
-// TestClaimDecisionNormalizeSource keeps the source label a closed enum.
-func TestClaimDecisionNormalizeSource(t *testing.T) {
+// TestClaimDecisionNormalizePath keeps the claim_path label a closed enum.
+func TestClaimDecisionNormalizePath(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		source string
-		want   string
+		claimPath string
+		want      string
 	}{
-		{source: claimSourceAgent, want: claimSourceAgent},
-		{source: claimSourceRuntime, want: claimSourceRuntime},
-		{source: claimSourceBatch, want: claimSourceBatch},
-		{source: "", want: "other"},
-		{source: "daemon", want: "other"},
-		{source: "AGENT", want: "other"},
+		{claimPath: claimPathAgent, want: claimPathAgent},
+		{claimPath: claimPathRuntime, want: claimPathRuntime},
+		{claimPath: claimPathBatch, want: claimPathBatch},
+		{claimPath: "", want: "other"},
+		{claimPath: "daemon", want: "other"},
+		{claimPath: "AGENT", want: "other"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.source, func(t *testing.T) {
+		t.Run(tt.claimPath, func(t *testing.T) {
 			t.Parallel()
-			if got := normalizeClaimSource(tt.source); got != tt.want {
-				t.Fatalf("normalizeClaimSource(%q) = %q, want %q", tt.source, got, tt.want)
+			if got := normalizeClaimPath(tt.claimPath); got != tt.want {
+				t.Fatalf("normalizeClaimPath(%q) = %q, want %q", tt.claimPath, got, tt.want)
 			}
 		})
 	}
@@ -110,13 +111,13 @@ func TestClaimDecisionNilMetricsIsSafe(t *testing.T) {
 		claimOutcomeEmptyDB,
 		claimOutcomeErrorClaim,
 	} {
-		svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, outcome, claimScope{source: claimSourceRuntime, candidates: 1}, claimDecisionDetail{running: 2, maxConcurrent: 2})
+		svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, outcome, claimScope{claimPath: claimPathRuntime, candidates: 1}, claimDecisionDetail{running: 2, maxConcurrent: 2})
 	}
 }
 
 // TestClaimDecisionIncrementsLabeledSeries verifies the funnel lands each
-// decision on exactly its (source, outcome, reason) series, that an
-// unclassified source is normalized to "other", and that a never-fired
+// decision on exactly its (claim_path, outcome, reason) series, that an
+// unclassified path is normalized to "other", and that a never-fired
 // prewarmed series still reads as zero rather than being absent.
 func TestClaimDecisionIncrementsLabeledSeries(t *testing.T) {
 	t.Parallel()
@@ -124,34 +125,38 @@ func TestClaimDecisionIncrementsLabeledSeries(t *testing.T) {
 	m := obsmetrics.NewBusinessMetrics()
 	svc := &TaskService{Metrics: m}
 
-	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeNoTasks, claimScope{source: claimSourceRuntime, candidates: 2}, claimDecisionDetail{})
-	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeNoTasks, claimScope{source: claimSourceAgent}, claimDecisionDetail{})
-	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeNoCapacity, claimScope{source: claimSourceAgent}, claimDecisionDetail{running: 3, maxConcurrent: 3})
-	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeEmptyDB, claimScope{source: claimSourceRuntime}, claimDecisionDetail{})
-	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeErrorList, claimScope{source: "daemon"}, claimDecisionDetail{})
+	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeNoTasks, claimScope{claimPath: claimPathRuntime, candidates: 2}, claimDecisionDetail{})
+	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeNoTasks, claimScope{claimPath: claimPathAgent}, claimDecisionDetail{})
+	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeNoCapacity, claimScope{claimPath: claimPathAgent}, claimDecisionDetail{running: 3, maxConcurrent: 3})
+	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeEmptyDB, claimScope{claimPath: claimPathBatch}, claimDecisionDetail{})
+	svc.recordClaimDecision(pgtype.UUID{}, pgtype.UUID{}, claimOutcomeErrorList, claimScope{claimPath: "daemon"}, claimDecisionDetail{})
 
 	tests := []struct {
-		source, outcome, reason string
-		want                    float64
+		claimPath, outcome, reason string
+		want                       float64
 	}{
-		{claimSourceRuntime, claimOutcomeNoTasks, claimReasonCandidatesBlocked, 1},
-		{claimSourceRuntime, claimOutcomeNoTasks, claimReasonNoCandidates, 0},
-		{claimSourceAgent, claimOutcomeNoTasks, claimReasonUnknownCandidates, 1},
-		{claimSourceAgent, claimOutcomeNoCapacity, claimReasonAgentConcurrencyCap, 1},
-		{claimSourceRuntime, claimOutcomeEmptyDB, claimReasonEmptyQueue, 1},
-		// An unknown source is normalized to "other" rather than minting a
+		{claimPathRuntime, claimOutcomeNoTasks, claimReasonCandidatesUnclaimed, 1},
+		{claimPathRuntime, claimOutcomeNoTasks, claimReasonNoVisibleCandidates, 0},
+		{claimPathAgent, claimOutcomeNoTasks, claimReasonUnknownCandidates, 1},
+		{claimPathAgent, claimOutcomeNoCapacity, claimReasonAgentConcurrencyCap, 1},
+		{claimPathBatch, claimOutcomeEmptyDB, claimReasonNoVisibleCandidates, 1},
+		// An unknown path is normalized to "other" rather than minting a
 		// per-call-site series.
 		{"other", claimOutcomeErrorList, claimReasonError, 1},
-		{claimSourceRuntime, claimOutcomeErrorList, claimReasonError, 0},
-		// A prewarmed series that has not fired reads as zero.
-		{claimSourceBatch, claimOutcomeNoTasks, claimReasonCandidatesBlocked, 0},
-		{claimSourceRuntime, claimOutcomeReclaimedDispatched, claimReasonStaleDispatchRecovered, 0},
+		{claimPathRuntime, claimOutcomeErrorList, claimReasonError, 0},
+		// Prewarmed series that have not fired read as zero, including the
+		// batch poll exits.
+		{claimPathBatch, claimOutcomeNoTasks, claimReasonCandidatesUnclaimed, 0},
+		{claimPathBatch, claimOutcomeReclaimedDispatched, claimReasonStaleDispatchRecover, 0},
+		{claimPathBatch, claimOutcomeEmptyCacheHit, claimReasonEmptyCache, 0},
+		{claimPathBatch, claimOutcomeErrorPromoteDeferred, claimReasonError, 0},
+		{claimPathRuntime, claimOutcomeReclaimedDispatched, claimReasonStaleDispatchRecover, 0},
 	}
 	for _, tt := range tests {
-		t.Run(tt.source+"/"+tt.outcome+"/"+tt.reason, func(t *testing.T) {
+		t.Run(tt.claimPath+"/"+tt.outcome+"/"+tt.reason, func(t *testing.T) {
 			t.Parallel()
-			if got := claimDecisionCount(t, m, tt.source, tt.outcome, tt.reason); got != tt.want {
-				t.Fatalf("claim_decision_total{%s,%s,%s} = %v, want %v", tt.source, tt.outcome, tt.reason, got, tt.want)
+			if got := claimDecisionCount(t, m, tt.claimPath, tt.outcome, tt.reason); got != tt.want {
+				t.Fatalf("claim_decision_total{%s,%s,%s} = %v, want %v", tt.claimPath, tt.outcome, tt.reason, got, tt.want)
 			}
 		})
 	}
@@ -159,9 +164,9 @@ func TestClaimDecisionIncrementsLabeledSeries(t *testing.T) {
 
 // ---- helpers ---------------------------------------------------------------
 
-// claimDecisionCount reads one (source, outcome, reason) series of the claim
-// decision counter out of a freshly gathered registry.
-func claimDecisionCount(t *testing.T, m *obsmetrics.BusinessMetrics, source, outcome, reason string) float64 {
+// claimDecisionCount reads one (claim_path, outcome, reason) series of the
+// claim decision counter out of a freshly gathered registry.
+func claimDecisionCount(t *testing.T, m *obsmetrics.BusinessMetrics, claimPath, outcome, reason string) float64 {
 	t.Helper()
 
 	fam := obsmetrics.GatherForTest(t, m)["multica_agent_task_claim_decision_total"]
@@ -169,10 +174,10 @@ func claimDecisionCount(t *testing.T, m *obsmetrics.BusinessMetrics, source, out
 		t.Fatalf("multica_agent_task_claim_decision_total not registered")
 	}
 	for _, mtr := range fam.GetMetric() {
-		if labelValue(mtr, "source") == source && labelValue(mtr, "outcome") == outcome && labelValue(mtr, "reason") == reason {
+		if labelValue(mtr, "claim_path") == claimPath && labelValue(mtr, "outcome") == outcome && labelValue(mtr, "reason") == reason {
 			return mtr.GetCounter().GetValue()
 		}
 	}
-	t.Fatalf("no sample for %s/%s/%s", source, outcome, reason)
+	t.Fatalf("no sample for %s/%s/%s", claimPath, outcome, reason)
 	return 0
 }
