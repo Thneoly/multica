@@ -36,7 +36,12 @@ const (
 	labelOutcome      = "outcome"
 	labelStage        = "stage"
 	labelClaimPath    = "claim_path"
-	labelDecision     = "decision"
+	// labelDecision is deliberately not labelAction: the entitlement and
+	// autopilot quota decision counters use "action" for their off/observe/
+	// enforce dimension, while the claim constraint SPI labels a policy's
+	// allow/wait/deny verdict — a different question, and a different series
+	// from claim_decision_total's outcome, so the names stay distinct.
+	labelDecision = "decision"
 )
 
 var businessMetricLabels = map[string][]string{

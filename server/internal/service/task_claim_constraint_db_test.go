@@ -180,6 +180,31 @@ func TestClaimConstraintDBBatchWait(t *testing.T) {
 	}
 }
 
+// TestClaimConstraintDBIdlePollRecordsNothing pins the funnel boundary: the
+// policy is only consulted at the candidate stage, so an idle poll (no
+// candidates) never evaluates anything — the constraint family stays at zero
+// while the sibling claim decision funnel still records its own empty_db
+// outcome for the same poll.
+func TestClaimConstraintDBIdlePollRecordsNothing(t *testing.T) {
+	f := newClaimConstraintFixture(t, ClaimConstraintCanaryPolicy{})
+
+	claimed, err := f.svc.ClaimTaskForRuntime(context.Background(), f.runtimeID)
+	if err != nil {
+		t.Fatalf("ClaimTaskForRuntime: %v", err)
+	}
+	if claimed != nil {
+		t.Fatal("ClaimTaskForRuntime claimed a task, want an idle poll")
+	}
+	for _, s := range claimConstraintZeroSeries(t, f.metrics) {
+		if s.value != 0 {
+			t.Fatalf("claim_constraint series {%s,%s,%s} = %v after an idle poll, want 0", s.claimPath, s.decision, s.reason, s.value)
+		}
+	}
+	if got := claimDecisionCount(t, f.metrics, claimPathRuntime, claimOutcomeEmptyDB, claimReasonNoVisibleCandidates); got != 1 {
+		t.Fatalf("claim_decision_total{runtime,empty_db,no_visible_candidates} = %v, want 1", got)
+	}
+}
+
 // TestClaimConstraintDBNilPolicyIsTransparent is the zero-behavior-change
 // regression: with ClaimConstraints nil (the default), the claim still works
 // and no claim_constraint series moves at all.

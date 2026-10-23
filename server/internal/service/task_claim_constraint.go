@@ -59,9 +59,12 @@ type ClaimConstraintRequest struct {
 	Candidates int
 }
 
-// ClaimConstraintDecision is the policy's verdict. It mirrors the entitlement
-// Decision layout: plain Action/Reason strings, no error, no structured
-// payload, so the shadow funnel can record it without interpretation.
+// ClaimConstraintDecision is the policy's verdict: plain Action/Reason
+// strings, no error, no structured payload, so the shadow funnel can record
+// it without interpretation. It mirrors the entitlement Provider *contract*
+// (single method, no error return, fail-open) rather than entitlement's typed
+// Decision fields; the enums are closed at the funnel's normalizers, like the
+// #9184 outcome constants.
 type ClaimConstraintDecision struct {
 	Action string
 	Reason string
