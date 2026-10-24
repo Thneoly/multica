@@ -2198,7 +2198,7 @@ WHERE atq.runtime_id = $1
             OR r.visibility = 'private'
         )
   )
-ORDER BY atq.priority DESC, atq.created_at ASC;
+ORDER BY atq.priority DESC, atq.created_at ASC, atq.id ASC;
 
 -- name: CancelSupersededDeferredRetriesForRuntimes :many
 -- Cancels deferred auto-retry rows that a newer active task has already
@@ -2319,7 +2319,7 @@ WHERE atq.runtime_id = ANY(@runtime_ids::uuid[])
             OR r.visibility = 'private'
         )
   )
-ORDER BY atq.priority DESC, atq.created_at ASC;
+ORDER BY atq.priority DESC, atq.created_at ASC, atq.id ASC;
 
 -- name: NextDeferredTaskFireAtForRuntimes :one
 -- Returns the next future deferred task for a daemon's authorized runtime set,
