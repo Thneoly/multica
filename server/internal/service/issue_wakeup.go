@@ -813,7 +813,9 @@ func (s *IssueWakeupService) dispatchFromTick(ctx context.Context, w db.IssueWak
 	// Outcome writes must not turn a busy rule row into another batch-wide
 	// wait. Use the batch context, not dispatch's expired per-rule context.
 	dispatch := s.dispatch
-	if w.SystemRule.Valid {
+	if w.SystemRule.Valid && !isDelegationSystemRule(w.SystemRule.String) {
+		// A delegation rule names its target agent and creator; the ordinary
+		// dispatcher already serves both, including the leader-run semantics.
 		dispatch = s.dispatchSystem
 	}
 	if err := dispatch(ctx, w); err != nil {
@@ -1471,9 +1473,20 @@ func (s *IssueWakeupService) CheckClaim(ctx context.Context, task db.AgentTaskQu
 		return err
 	}
 	if w.SystemRule.Valid {
-		// A system rule's run targets the assignee resolved when it fired; it
-		// is claimable while the rule is on and that agent can still run.
-		if !w.Enabled || w.DisabledAt.Valid || w.Revision != source.Revision || w.IssueID != task.IssueID {
+		// A child_done run targets the assignee resolved when it fired; it is
+		// claimable while the rule is on and that agent can still run. A
+		// delegation rule instead names its leader: it stops once it fires
+		// like any once rule, with disabled_at left NULL so the run it created
+		// remains claimable.
+		gone := w.DisabledAt.Valid || w.Revision != source.Revision || w.IssueID != task.IssueID
+		if !gone {
+			if isDelegationSystemRule(w.SystemRule.String) {
+				gone = w.AgentID != task.AgentID
+			} else {
+				gone = !w.Enabled
+			}
+		}
+		if gone {
 			return ErrWakeupForbidden
 		}
 		agent, err := s.Tasks.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: task.AgentID, WorkspaceID: w.WorkspaceID})

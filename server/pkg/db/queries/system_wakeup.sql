@@ -9,6 +9,18 @@ VALUES(@id,@workspace_id,@issue_id,'','event','continuous',@event_types,'UTC',@c
 ON CONFLICT (issue_id,system_rule) WHERE system_rule IS NOT NULL DO NOTHING
 RETURNING *;
 
+-- name: CreateDelegationWakeup :one
+-- The platform rule that wakes a squad's leader when one delegated member run
+-- ends. Unlike child_done it names a fixed target (the leader) and the human
+-- its run continues, so agent_id and created_by are set; the delegated member
+-- task is part of the system_rule value, which makes the (issue_id,
+-- system_rule) unique index the rule's fingerprint: two writers ensuring it at
+-- once keep the first row, and the loser reads it back with GetSystemWakeup.
+INSERT INTO issue_wakeup(id,workspace_id,issue_id,agent_id,created_by,source_task_id,instruction,kind,mode,event_types,filter_task_id,timezone,enabled,system_rule)
+VALUES(@id,@workspace_id,@issue_id,@agent_id,@created_by,sqlc.narg(source_task_id),@instruction,'event','once',@event_types,@filter_task_id,'UTC',true,@system_rule)
+ON CONFLICT (issue_id,system_rule) WHERE system_rule IS NOT NULL DO NOTHING
+RETURNING *;
+
 -- name: CustomizeSystemWakeup :one
 -- A person changed the rule on this issue; it stops following the workspace
 -- default. Turning it on clears a platform pause.

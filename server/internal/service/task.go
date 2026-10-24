@@ -1545,6 +1545,9 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	// See EnqueueTaskForIssue for ordering rationale.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
 	s.NotifyTaskEnqueued(ctx, task)
+	// When this run is @mention delegation inside a squad, arm the rule that
+	// wakes the leader once the run ends. Best effort: never blocks the enqueue.
+	s.ensureDelegationWakeupRule(ctx, issue, agentID, task.ID, originatorUserID, triggerCommentID, isLeader)
 	return task, nil
 }
 

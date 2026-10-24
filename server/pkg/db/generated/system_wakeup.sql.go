@@ -144,6 +144,88 @@ func (q *Queries) CountCustomizedSystemWakeups(ctx context.Context, arg CountCus
 	return count, err
 }
 
+const createDelegationWakeup = `-- name: CreateDelegationWakeup :one
+INSERT INTO issue_wakeup(id,workspace_id,issue_id,agent_id,created_by,source_task_id,instruction,kind,mode,event_types,filter_task_id,timezone,enabled,system_rule)
+VALUES($1,$2,$3,$4,$5,$6,$7,'event','once',$8,$9,'UTC',true,$10)
+ON CONFLICT (issue_id,system_rule) WHERE system_rule IS NOT NULL DO NOTHING
+RETURNING id, workspace_id, issue_id, agent_id, created_by, source_task_id, parent_comment_id, instruction, kind, mode, event_types, filter_agent_id, filter_task_id, interval_seconds, cron_expression, timezone, next_fire_at, enabled, disabled_at, revision, last_task_id, last_error, created_at, updated_at, filter_actor_type, filter_actor_id, expires_at, expiry_seconds, on_timeout, timed_out_at, system_rule, customized_at, condition, condition_state, max_fires, fire_count, paused_reason
+`
+
+type CreateDelegationWakeupParams struct {
+	ID           pgtype.UUID `json:"id"`
+	WorkspaceID  pgtype.UUID `json:"workspace_id"`
+	IssueID      pgtype.UUID `json:"issue_id"`
+	AgentID      pgtype.UUID `json:"agent_id"`
+	CreatedBy    pgtype.UUID `json:"created_by"`
+	SourceTaskID pgtype.UUID `json:"source_task_id"`
+	Instruction  string      `json:"instruction"`
+	EventTypes   []string    `json:"event_types"`
+	FilterTaskID pgtype.UUID `json:"filter_task_id"`
+	SystemRule   pgtype.Text `json:"system_rule"`
+}
+
+// The platform rule that wakes a squad's leader when one delegated member run
+// ends. Unlike child_done it names a fixed target (the leader) and the human
+// its run continues, so agent_id and created_by are set; the delegated member
+// task is part of the system_rule value, which makes the (issue_id,
+// system_rule) unique index the rule's fingerprint: two writers ensuring it at
+// once keep the first row, and the loser reads it back with GetSystemWakeup.
+func (q *Queries) CreateDelegationWakeup(ctx context.Context, arg CreateDelegationWakeupParams) (IssueWakeup, error) {
+	row := q.db.QueryRow(ctx, createDelegationWakeup,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.IssueID,
+		arg.AgentID,
+		arg.CreatedBy,
+		arg.SourceTaskID,
+		arg.Instruction,
+		arg.EventTypes,
+		arg.FilterTaskID,
+		arg.SystemRule,
+	)
+	var i IssueWakeup
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.IssueID,
+		&i.AgentID,
+		&i.CreatedBy,
+		&i.SourceTaskID,
+		&i.ParentCommentID,
+		&i.Instruction,
+		&i.Kind,
+		&i.Mode,
+		&i.EventTypes,
+		&i.FilterAgentID,
+		&i.FilterTaskID,
+		&i.IntervalSeconds,
+		&i.CronExpression,
+		&i.Timezone,
+		&i.NextFireAt,
+		&i.Enabled,
+		&i.DisabledAt,
+		&i.Revision,
+		&i.LastTaskID,
+		&i.LastError,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.FilterActorType,
+		&i.FilterActorID,
+		&i.ExpiresAt,
+		&i.ExpirySeconds,
+		&i.OnTimeout,
+		&i.TimedOutAt,
+		&i.SystemRule,
+		&i.CustomizedAt,
+		&i.Condition,
+		&i.ConditionState,
+		&i.MaxFires,
+		&i.FireCount,
+		&i.PausedReason,
+	)
+	return i, err
+}
+
 const createSystemWakeup = `-- name: CreateSystemWakeup :one
 INSERT INTO issue_wakeup(id,workspace_id,issue_id,instruction,kind,mode,event_types,timezone,condition,condition_state,enabled,system_rule)
 VALUES($1,$2,$3,'','event','continuous',$4,'UTC',$5,$6,$7,$8)
