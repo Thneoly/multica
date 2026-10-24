@@ -1423,7 +1423,16 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 // Unlike EnqueueTaskForIssue, this takes an explicit agent ID rather than
 // deriving it from the issue assignee.
 func (s *TaskService) EnqueueTaskForMention(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, origin RunOrigin) (db.AgentTaskQueue, error) {
-	return s.enqueueMentionTask(ctx, issue, agentID, triggerCommentID, false, pgtype.UUID{}, false, "", pgtype.UUID{}, pgtype.UUID{}, origin)
+	task, err := s.enqueueMentionTask(ctx, issue, agentID, triggerCommentID, false, pgtype.UUID{}, false, "", pgtype.UUID{}, pgtype.UUID{}, origin)
+	if err != nil {
+		return task, err
+	}
+	// Only the explicit @mention path arms the delegation rule: the routed
+	// fallbacks (a threaded reply, a conversation continuation) create a run
+	// for work the target already saw, not a delegation whose end the leader
+	// must be woken about. Best effort: never blocks the enqueue.
+	s.ensureDelegationWakeupRule(ctx, issue, agentID, task.ID, task.OriginatorUserID, triggerCommentID)
+	return task, nil
 }
 
 // EnqueueTaskForThreadParent creates a queued task for the agent who authored
@@ -1545,9 +1554,6 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	// See EnqueueTaskForIssue for ordering rationale.
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
 	s.NotifyTaskEnqueued(ctx, task)
-	// When this run is @mention delegation inside a squad, arm the rule that
-	// wakes the leader once the run ends. Best effort: never blocks the enqueue.
-	s.ensureDelegationWakeupRule(ctx, issue, agentID, task.ID, originatorUserID, triggerCommentID, isLeader)
 	return task, nil
 }
 
@@ -6156,7 +6162,17 @@ func (s *TaskService) enqueueRerunTask(ctx context.Context, issue db.Issue, agen
 		util.UUIDToString(issue.AssigneeID) == util.UUIDToString(agentID) {
 		return s.enqueueIssueTaskWithCommentPlan(ctx, issue, triggerCommentID, coalescedCommentIDs, true, "", actorUserID, rerunOfTaskID, pgtype.Timestamptz{}, origin)
 	}
-	return s.enqueueMentionTaskWithCommentPlan(ctx, issue, agentID, triggerCommentID, coalescedCommentIDs, isLeader, squadID, true, "", actorUserID, rerunOfTaskID, origin)
+	task, err := s.enqueueMentionTaskWithCommentPlan(ctx, issue, agentID, triggerCommentID, coalescedCommentIDs, isLeader, squadID, true, "", actorUserID, rerunOfTaskID, origin)
+	if err != nil {
+		return task, err
+	}
+	// A retried delegated run is still delegated work: re-arm so the leader is
+	// woken when the retry ends. A leader rerun is a leader turn, not
+	// delegated work.
+	if !isLeader {
+		s.ensureDelegationWakeupRule(ctx, issue, agentID, task.ID, task.OriginatorUserID, triggerCommentID)
+	}
+	return task, nil
 }
 
 // The bulk terminal writes below are the sweeper, archive and daemon-recovery

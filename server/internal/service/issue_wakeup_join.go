@@ -373,6 +373,17 @@ func (s *IssueWakeupService) mayJoin(ctx context.Context, q *db.Queries, issue d
 	if !w.Enabled || issuestatus.Effective(ctx, q, issue.WorkspaceID, issue.Status) == "backlog" {
 		return "", false, nil
 	}
+	if isDelegationSystemRule(w.SystemRule.String) {
+		// A delegation rule names its target when created: the squad's leader
+		// and the human the delegated run runs as. It joins a queued run of
+		// exactly that pair — the same judgment dispatch's hasWaitingRun made
+		// when it kept the inputs — and the note carries the rule's own
+		// instruction, not the child_done template.
+		if w.AgentID != task.AgentID || w.CreatedBy != task.OriginatorUserID {
+			return "", false, nil
+		}
+		return w.Instruction, true, nil
+	}
 	target, err := resolveWakeTarget(ctx, q, issue)
 	if err != nil || target.Agent.ID != task.AgentID {
 		return "", false, err

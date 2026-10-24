@@ -597,6 +597,34 @@ func (q *Queries) DeleteIssueWakeupReceipts(ctx context.Context, id pgtype.UUID)
 	return err
 }
 
+const deleteSpentDelegationWakeups = `-- name: DeleteSpentDelegationWakeups :execrows
+WITH batch AS MATERIALIZED (
+ SELECT w.id FROM issue_wakeup w
+ WHERE w.system_rule LIKE 'delegation_done:%' AND NOT w.enabled
+  AND NOT EXISTS(SELECT 1 FROM issue_wakeup_receipt r WHERE r.wakeup_id=w.id AND r.processed_at IS NULL)
+  AND NOT EXISTS(SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text
+    AND t.status IN ('queued','deferred','dispatched','running','waiting_local_directory'))
+  AND w.updated_at < $1
+ ORDER BY w.updated_at,w.id LIMIT 100 FOR UPDATE SKIP LOCKED
+), gone AS (
+ DELETE FROM issue_wakeup_receipt r USING batch WHERE r.wakeup_id=batch.id RETURNING r.wakeup_id
+)
+DELETE FROM issue_wakeup w USING batch WHERE w.id=batch.id
+`
+
+// A delegation rule exists once per delegated run and no user path may delete
+// a system rule, so the platform removes its own: spent or disabled, with no
+// input left to deliver and no run left to claim, after the receipts' seven-
+// day retention. Receipts go with the rule; the runs it created are ordinary
+// history and stay.
+func (q *Queries) DeleteSpentDelegationWakeups(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSpentDelegationWakeups, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const disableIssueWakeups = `-- name: DisableIssueWakeups :exec
 UPDATE issue_wakeup SET enabled=false,disabled_at=clock_timestamp(),updated_at=clock_timestamp()
 WHERE issue_id= $1 AND disabled_at IS NULL AND system_rule IS NULL
@@ -946,7 +974,8 @@ LEFT JOIN member actor_member ON w.filter_actor_type='member' AND actor_member.u
 LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
 LEFT JOIN agent source ON source.id=w.filter_agent_id AND source.workspace_id=w.workspace_id AND source.id=ANY($1::uuid[])
 LEFT JOIN agent_task_queue t ON t.id=w.last_task_id AND t.issue_id=w.issue_id AND t.agent_id=w.agent_id
-WHERE w.workspace_id= $2 AND w.issue_id= $3 ORDER BY w.created_at,w.id
+WHERE w.workspace_id= $2 AND w.issue_id= $3 AND w.system_rule IS NULL
+ORDER BY w.created_at,w.id
 `
 
 type ListIssueWakeupsParams struct {
@@ -1108,7 +1137,8 @@ func (q *Queries) ListPausedWakeupIssues(ctx context.Context, workspaceID pgtype
 
 const listPendingWakeupInputGroups = `-- name: ListPendingWakeupInputGroups :many
 WITH groups AS (
- SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS system_rule,
+ SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS is_system_rule,
+  w.system_rule, w.agent_id, w.created_by,
   (r.task_id IS NOT NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.id=r.task_id
     AND t.started_at IS NULL AND t.status NOT IN ('running','completed','failed','cancelled')))::bool AS reserved,
   EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')::bool AS own_claimed,
@@ -1118,9 +1148,10 @@ WITH groups AS (
  FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
  WHERE r.processed_at IS NULL
   AND ($5::uuid[] IS NULL OR w.workspace_id = ANY($5::uuid[]))
- GROUP BY 1,2,3,4,5,6
+ GROUP BY 1,2,3,4,5,6,7,8,9
 )
-SELECT g.wakeup_id, g.issue_id, g.system_rule, g.reserved, g.own_claimed, g.user_waiting, g.oldest, g.inputs FROM groups g
+SELECT g.wakeup_id, g.issue_id, g.is_system_rule, g.system_rule, g.agent_id, g.created_by,
+ g.reserved, g.own_claimed, g.user_waiting, g.oldest, g.inputs FROM groups g
 WHERE $1::timestamptz IS NULL
    OR (g.oldest, g.wakeup_id, g.reserved) > ($1::timestamptz, $2::uuid, $3::bool)
 ORDER BY g.oldest, g.wakeup_id, g.reserved LIMIT $4
@@ -1135,14 +1166,17 @@ type ListPendingWakeupInputGroupsParams struct {
 }
 
 type ListPendingWakeupInputGroupsRow struct {
-	WakeupID    pgtype.UUID        `json:"wakeup_id"`
-	IssueID     pgtype.UUID        `json:"issue_id"`
-	SystemRule  bool               `json:"system_rule"`
-	Reserved    bool               `json:"reserved"`
-	OwnClaimed  bool               `json:"own_claimed"`
-	UserWaiting bool               `json:"user_waiting"`
-	Oldest      pgtype.Timestamptz `json:"oldest"`
-	Inputs      int32              `json:"inputs"`
+	WakeupID     pgtype.UUID        `json:"wakeup_id"`
+	IssueID      pgtype.UUID        `json:"issue_id"`
+	IsSystemRule bool               `json:"is_system_rule"`
+	SystemRule   pgtype.Text        `json:"system_rule"`
+	AgentID      pgtype.UUID        `json:"agent_id"`
+	CreatedBy    pgtype.UUID        `json:"created_by"`
+	Reserved     bool               `json:"reserved"`
+	OwnClaimed   bool               `json:"own_claimed"`
+	UserWaiting  bool               `json:"user_waiting"`
+	Oldest       pgtype.Timestamptz `json:"oldest"`
+	Inputs       int32              `json:"inputs"`
 }
 
 // Scheduler observability over unprocessed inputs, grouped per rule and by
@@ -1155,8 +1189,10 @@ type ListPendingWakeupInputGroupsRow struct {
 //	              next dispatch, so both are backlog.
 //	own_claimed:  the rule's own run is claimed (FindPendingWakeupTask).
 //	user_waiting: a queued run of the rule's agent, run as its creator, will
-//	              take them along (hasWaitingRun). Platform rules wait for the
-//	              issue's current target instead; the caller resolves that.
+//	              take them along (hasWaitingRun). Platform rules wait for
+//	              their own target instead; the caller resolves that per rule
+//	              (a child_done rule waits for the issue's current target, a
+//	              delegation rule for the leader and creator it names).
 //
 // Oldest groups first, one page at a time: the caller pages with the last
 // group's (oldest, wakeup_id, reserved) until a short page, so no group is
@@ -1179,7 +1215,10 @@ func (q *Queries) ListPendingWakeupInputGroups(ctx context.Context, arg ListPend
 		if err := rows.Scan(
 			&i.WakeupID,
 			&i.IssueID,
+			&i.IsSystemRule,
 			&i.SystemRule,
+			&i.AgentID,
+			&i.CreatedBy,
 			&i.Reserved,
 			&i.OwnClaimed,
 			&i.UserWaiting,
@@ -1379,7 +1418,7 @@ WITH ranked AS (
 LEFT JOIN member actor_member ON w.filter_actor_type='member' AND actor_member.user_id=w.filter_actor_id AND actor_member.workspace_id=w.workspace_id
 LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
 LEFT JOIN agent source ON source.id=w.filter_agent_id AND source.workspace_id=w.workspace_id AND source.id=ANY($1::uuid[])
- WHERE w.workspace_id= $2 AND w.enabled
+ WHERE w.workspace_id= $2 AND w.enabled AND w.system_rule IS NULL
   AND i.status NOT IN ('done','cancelled')
   AND NOT EXISTS(SELECT 1 FROM issue_status s WHERE s.workspace_id=i.workspace_id AND s.key=i.status AND s.category IN ('done','closed'))
 )
@@ -1415,6 +1454,8 @@ type ListWorkspaceWakeupSummaryRowsRow struct {
 }
 
 // No prompts/history; at most three previews per issue plus exact counts.
+// Platform rules never appear: they are not subscriptions, and a delegation
+// rule's agent_id (the leader) would otherwise leak into the counts.
 func (q *Queries) ListWorkspaceWakeupSummaryRows(ctx context.Context, arg ListWorkspaceWakeupSummaryRowsParams) ([]ListWorkspaceWakeupSummaryRowsRow, error) {
 	rows, err := q.db.Query(ctx, listWorkspaceWakeupSummaryRows, arg.AgentIds, arg.WorkspaceID)
 	if err != nil {
@@ -1557,6 +1598,88 @@ type LockWakeupSourceTaskParams struct {
 
 func (q *Queries) LockWakeupSourceTask(ctx context.Context, arg LockWakeupSourceTaskParams) (AgentTaskQueue, error) {
 	row := q.db.QueryRow(ctx, lockWakeupSourceTask, arg.ID, arg.IssueID)
+	var i AgentTaskQueue
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.IssueID,
+		&i.Status,
+		&i.Priority,
+		&i.DispatchedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Result,
+		&i.Error,
+		&i.CreatedAt,
+		&i.Context,
+		&i.RuntimeID,
+		&i.SessionID,
+		&i.WorkDir,
+		&i.TriggerCommentID,
+		&i.ChatSessionID,
+		&i.AutopilotRunID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ParentTaskID,
+		&i.FailureReason,
+		&i.TriggerSummary,
+		&i.ForceFreshSession,
+		&i.IsLeaderTask,
+		&i.WaitReason,
+		&i.InitiatorUserID,
+		&i.HandoffNote,
+		&i.PrepareLeaseExpiresAt,
+		&i.SquadID,
+		&i.RuntimeMcpOverlay,
+		&i.EscalationForTaskID,
+		&i.FireAt,
+		&i.OriginatorUserID,
+		&i.RuntimeConnectedApps,
+		&i.CoalescedCommentIds,
+		&i.DeliveredCommentIds,
+		&i.ChatInputTaskID,
+		&i.ChatFinalizeDeferredAt,
+		&i.OriginatorSource,
+		&i.DelegatedFromTaskID,
+		&i.RetryOfTaskID,
+		&i.RerunOfTaskID,
+		&i.RuleVersionID,
+		&i.TriggerEvidenceKind,
+		&i.TriggerEvidenceRefID,
+		&i.AccountableUserID,
+		&i.SessionRolloutMissing,
+		&i.RetiredSessionID,
+		&i.QuickActionsDisabled,
+		&i.RegenerateQuickActionsFor,
+		&i.BranchName,
+		&i.DurableWorkDir,
+		&i.ChannelContextRevision,
+		&i.CommentThreadID,
+		&i.CancelledByType,
+		&i.CancelledByID,
+		&i.CancelledByName,
+		&i.IssueSnapshot,
+		&i.WorkflowStep,
+		&i.QueueWaitReason,
+	)
+	return i, err
+}
+
+const lockWakeupSourceTaskWait = `-- name: LockWakeupSourceTaskWait :one
+SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot, workflow_step, queue_wait_reason FROM agent_task_queue WHERE id= $1 AND issue_id= $2 FOR UPDATE
+`
+
+type LockWakeupSourceTaskWaitParams struct {
+	ID      pgtype.UUID `json:"id"`
+	IssueID pgtype.UUID `json:"issue_id"`
+}
+
+// The same row as LockWakeupSourceTask, bounded by the caller's lock_timeout
+// instead of failing at once. The delegation ensure uses it to observe a run
+// whose terminal write is committing while the rule is being armed: once the
+// lock is granted, that write is visible, so the snapshot never misses it.
+func (q *Queries) LockWakeupSourceTaskWait(ctx context.Context, arg LockWakeupSourceTaskWaitParams) (AgentTaskQueue, error) {
+	row := q.db.QueryRow(ctx, lockWakeupSourceTaskWait, arg.ID, arg.IssueID)
 	var i AgentTaskQueue
 	err := row.Scan(
 		&i.ID,

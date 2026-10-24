@@ -10,12 +10,17 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
 	"github.com/multica-ai/multica/server/pkg/eventcontract"
 )
+
+// pgerrLockNotAvailable is SQLSTATE 55P03: a row lock hit NOWAIT or the
+// statement's lock_timeout.
+const pgerrLockNotAvailable = "55P03"
 
 // SystemRuleDelegationDone names the platform rule that closes the
 // leader→member→leader loop of @mention delegation on a squad-assigned issue:
@@ -63,9 +68,13 @@ func isDelegationSystemRule(systemRule string) bool {
 // records the receipt, and the ordinary dispatcher wakes the leader with
 // leader-run semantics. If the run reached its terminal state before the rule
 // existed, that outcome is recorded as the rule's first input so the leader is
-// still woken. A squad whose leader cannot run gets no rule: there is nothing
-// to wake, and the zero wakeup is returned whole.
+// still woken. A squad that cannot coordinate — archived, or led by an agent
+// that is gone, archived or runtime-less — gets no rule: there is nothing to
+// wake, and the zero wakeup is returned whole.
 func (s *TaskService) EnsureDelegationWakeupRule(ctx context.Context, issue db.Issue, squad db.Squad, memberTaskID, createdBy, leaderTaskID pgtype.UUID) (db.IssueWakeup, error) {
+	if squad.ArchivedAt.Valid {
+		return db.IssueWakeup{}, nil
+	}
 	leader, err := s.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: squad.LeaderID, WorkspaceID: issue.WorkspaceID})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return db.IssueWakeup{}, nil
@@ -103,7 +112,22 @@ func (s *TaskService) EnsureDelegationWakeupRule(ctx context.Context, issue db.I
 	}
 	// Subscribe and inspect the member run under the same transaction, so a
 	// run that ended between the enqueue and this rule still wakes the leader.
-	if member, err := q.GetAgentTask(ctx, memberTaskID); err == nil &&
+	// The read takes the run's row lock (bounded), so a terminal write that is
+	// committing now is visible once the lock is granted — the same race the
+	// save path closes with LockWakeupSourceTask. Best effort: a lock that
+	// times out skips the snapshot and leaves the rule armed.
+	if _, err = tx.Exec(ctx, "SET LOCAL lock_timeout = '250ms'"); err != nil {
+		return db.IssueWakeup{}, err
+	}
+	member, err := q.LockWakeupSourceTaskWait(ctx, db.LockWakeupSourceTaskWaitParams{ID: memberTaskID, IssueID: issue.ID})
+	if err != nil {
+		var lockBusy *pgconn.PgError
+		if !errors.Is(err, pgx.ErrNoRows) && !(errors.As(err, &lockBusy) && lockBusy.Code == pgerrLockNotAvailable) {
+			return db.IssueWakeup{}, err
+		}
+		member = db.AgentTaskQueue{}
+	}
+	if member.ID.Valid &&
 		slices.Contains([]string{"completed", "failed", "cancelled"}, member.Status) {
 		var now time.Time
 		if err := tx.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
@@ -146,17 +170,23 @@ func (s *TaskService) EnsureDelegationWakeupRule(ctx context.Context, issue db.I
 	return rule, nil
 }
 
-// ensureDelegationWakeupRule arms the delegation_done rule after a mention
-// enqueue created a member run. It applies only to the @mention delegation
-// shape: the issue is assigned to a squad, the delegating comment came from an
-// agent, and the run just created targets another agent — not the delegating
-// author (a self-mention), and not the squad's leader itself, whose runs are
-// leader turns rather than delegated work. Which agent delegated does not
-// matter: the leader is the coordinator the rule wakes either way. Failures
-// are logged and swallowed — the rule is a coordination aid and must never
-// block the enqueue it serves.
-func (s *TaskService) ensureDelegationWakeupRule(ctx context.Context, issue db.Issue, memberAgentID, memberTaskID, originator, triggerCommentID pgtype.UUID, isLeader bool) {
-	if isLeader || !triggerCommentID.Valid {
+// ensureDelegationWakeupRule arms the delegation_done rule after an enqueue
+// created a member run. It is called only from the explicit @mention path
+// (EnqueueTaskForMention) and the retry of a delegated member run: the routed
+// fallbacks — a threaded reply, a conversation continuation, a squad-leader
+// hop — create a run for work the target already saw, not a delegation whose
+// end the leader must be woken about. The @mention delegation shape: the
+// issue is assigned to a squad, the delegating comment came from an agent,
+// and the run just created targets another agent — not the delegating author
+// (a self-mention), and not the squad's leader itself, whose runs are leader
+// turns rather than delegated work. Which agent delegated does not matter,
+// and the target need not be a squad member — a deliberate choice: any
+// agent-to-agent hand-off on a squad-coordinated issue routes through the
+// leader, who is the coordinator the rule wakes either way. Failures are
+// logged and swallowed — the rule is a coordination aid and must never block
+// the enqueue it serves.
+func (s *TaskService) ensureDelegationWakeupRule(ctx context.Context, issue db.Issue, memberAgentID, memberTaskID, originator, triggerCommentID pgtype.UUID) {
+	if !triggerCommentID.Valid {
 		return
 	}
 	if issue.AssigneeType.String != "squad" || !issue.AssigneeID.Valid {

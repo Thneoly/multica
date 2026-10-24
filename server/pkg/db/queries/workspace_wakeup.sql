@@ -74,7 +74,7 @@ LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
   WHERE t.context->>'wakeup_id'=w.id::text AND t.issue_id=w.issue_id
    AND t.status IN ('queued','deferred','dispatched','running','waiting_local_directory')
  ) sr ON true
- WHERE w.workspace_id= @workspace_id AND w.system_rule IS NOT NULL AND agg.open_count>0
+ WHERE w.workspace_id= @workspace_id AND w.system_rule='child_done' AND agg.open_count>0
   AND p.status NOT IN ('done','cancelled')
   AND NOT EXISTS(SELECT 1 FROM issue_status s WHERE s.workspace_id=p.workspace_id AND s.key=p.status AND s.category IN ('done','closed'))
 ), classified AS (

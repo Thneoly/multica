@@ -310,6 +310,48 @@ func TestIssueWakeupRetryKeepsPromptAndSchedulingScope(t *testing.T) {
 	f.Cleanup(t, "DELETE FROM agent_task_queue WHERE id=$1", child.ID)
 }
 
+// TestIssueWakeupHoldsInputsForItsOwnDeferredRun pins the bounded handling of
+// the pending-task index: a run of the rule that FindPendingWakeupTask cannot
+// see — a media-pending deferral shares the rule's scheduling scope — must
+// hold the firing's inputs without failing the pass, and the inputs are not
+// stranded once that run ends.
+func TestIssueWakeupHoldsInputsForItsOwnDeferredRun(t *testing.T) {
+	f, s, issue, agent := conditionFixture(t)
+	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous",
+		EventTypes: []string{"comment.created"}, Instruction: "Review"})
+	f.Comment(t, util.UUIDToString(issue), "first")
+	wakeTick(t, f, s, w.ID)
+	if wakeRuns(t, f, w.ID) != 1 {
+		t.Fatal("the first firing started no run")
+	}
+	// Defer that run the way a media-pending channel enqueue is deferred: it
+	// stays pending under the rule's scheduling scope (its comment_thread_id)
+	// but leaves the statuses FindPendingWakeupTask reads.
+	f.Exec(t, "UPDATE agent_task_queue SET status='deferred', context=context||jsonb_build_object('channel_issue_media_pending','true') WHERE context->>'wakeup_id'=$1", util.UUIDToString(w.ID))
+
+	f.Comment(t, util.UUIDToString(issue), "second")
+	wakeTick(t, f, s, w.ID) // pre-fix: this pass failed on the unique index
+	if got := wakeRuns(t, f, w.ID); got != 1 {
+		t.Fatalf("the rule has %d runs beside its deferred one", got)
+	}
+	held, err := f.q.LocklessWakeup(context.Background(), w.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !held.Enabled || held.LastError.String == "" {
+		t.Fatalf("rule while its run is deferred: enabled=%v last_error=%q", held.Enabled, held.LastError.String)
+	}
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 1 {
+		t.Fatalf("the firing's input did not wait: %d pending", n)
+	}
+	// The deferred run ends without starting; the next pass takes over.
+	f.Exec(t, "UPDATE agent_task_queue SET status='cancelled', completed_at=now() WHERE context->>'wakeup_id'=$1 AND status='deferred'", util.UUIDToString(w.ID))
+	wakeTick(t, f, s, w.ID)
+	if got := wakeRuns(t, f, w.ID); got != 2 {
+		t.Fatalf("the rule has %d runs after its deferred one ended, want 2", got)
+	}
+}
+
 func TestIssueWakeupConcurrentDispatchIsIdempotent(t *testing.T) {
 	f, s, issue, agent := wakeFixture(t)
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "at", AfterSeconds: 1, Instruction: "once"})

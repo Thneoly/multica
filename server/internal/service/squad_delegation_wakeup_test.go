@@ -164,15 +164,18 @@ func TestSquadDelegationWakeupWakesLeaderWhenMemberRunEnds(t *testing.T) {
 			fx.tick(t)
 			fx.tick(t) // a second pass must not queue a second leader run
 
-			var leaderTaskID, wakeupID, squadID, note string
+			var leaderTaskID, wakeupID, squadID, note, systemMarker string
 			var isLeader bool
 			fx.QueryRow(t, `
-				SELECT id, context->>'wakeup_id', squad_id::text, is_leader_task, COALESCE(handoff_note,'')
+				SELECT id, context->>'wakeup_id', squad_id::text, is_leader_task, COALESCE(handoff_note,''), COALESCE(context->>'wakeup_system','')
 				FROM agent_task_queue
 				WHERE issue_id=$1 AND agent_id=$2 AND context->>'wakeup_id' IS NOT NULL
-			`, fx.issue.ID, fx.leader).Scan(&leaderTaskID, &wakeupID, &squadID, &isLeader, &note)
+			`, fx.issue.ID, fx.leader).Scan(&leaderTaskID, &wakeupID, &squadID, &isLeader, &note, &systemMarker)
 			if wakeupID != util.UUIDToString(rule.ID) {
 				t.Fatalf("woken run belongs to wakeup %s, want %s", wakeupID, util.UUIDToString(rule.ID))
+			}
+			if systemMarker != rule.SystemRule.String {
+				t.Fatalf("woken run wakeup_system = %q, want %q (the claim payload tells platform runs apart by it)", systemMarker, rule.SystemRule.String)
 			}
 			if !isLeader {
 				t.Fatal("the woken leader run is not is_leader_task; the claim path would skip the squad briefing")
@@ -296,6 +299,21 @@ func TestSquadDelegationWakeupNotArmedOutsideDelegation(t *testing.T) {
 			t.Fatalf("a leader-run enqueue armed %d rules, want 0", got)
 		}
 	})
+	t.Run("thread parent reply", func(t *testing.T) {
+		fx := newDelegationFixture(t)
+		// An agent hands a thread back to another agent: the routed run is for
+		// work the target already saw, not a delegation whose end the leader
+		// must be woken about.
+		comment := fx.Comment(t, util.UUIDToString(fx.issue.ID), "over to you on this thread", testutil.Cols{
+			"author_type": "agent", "author_id": fx.leader, "source_task_id": fx.leaderTask,
+		})
+		if _, err := fx.svc.TaskSvc.EnqueueTaskForThreadParent(context.Background(), fx.issue, parseTestUUID(t, fx.member), parseTestUUID(t, comment)); err != nil {
+			t.Fatalf("EnqueueTaskForThreadParent: %v", err)
+		}
+		if got := fx.ruleCount(t); got != 0 {
+			t.Fatalf("a threaded reply armed %d rules, want 0", got)
+		}
+	})
 	t.Run("worker author still wakes the leader", func(t *testing.T) {
 		fx := newDelegationFixture(t)
 		workerRuntime := fx.Runtime(t, "delegation worker runtime")
@@ -339,5 +357,147 @@ func TestSquadDelegationWakeupSurvivesTerminalRace(t *testing.T) {
 	fx.tick(t)
 	if n := fx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND context->>'wakeup_id' IS NOT NULL", fx.issue.ID, fx.leader); n != 1 {
 		t.Fatalf("leader woken %d times for an already-ended run, want 1", n)
+	}
+}
+
+// TestSquadDelegationWakeupArmsNothingWithoutAUsableLeader pins the silent
+// no-rule contract: the enqueue hook swallows errors, so a squad that cannot
+// coordinate must be filtered by these gates, and Ensure must return its zero
+// value rather than an error. A future change that turns an early return into
+// a failure or drops a gate fails here instead of silently refusing enqueues.
+func TestSquadDelegationWakeupArmsNothingWithoutAUsableLeader(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(fx delegationFixture)
+	}{
+		{"leader archived", func(fx delegationFixture) {
+			fx.Exec(t, "UPDATE agent SET archived_at=now() WHERE id=$1", fx.leader)
+		}},
+		{"leader without a runtime", func(fx delegationFixture) {
+			fx.Exec(t, "UPDATE agent SET runtime_id=NULL WHERE id=$1", fx.leader)
+		}},
+		{"leader in another workspace", func(fx delegationFixture) {
+			otherWS := fx.Workspace(t, "delegation foreign ws", "delegation-foreign-ws")
+			runtime := fx.Runtime(t, "delegation foreign runtime", testutil.Cols{"workspace_id": otherWS})
+			foreign := fx.Agent(t, "Delegation foreign leader", runtime, testutil.Cols{"workspace_id": otherWS})
+			fx.Exec(t, "UPDATE squad SET leader_id=$2 WHERE id=$1", fx.squad, foreign)
+		}},
+		{"squad archived", func(fx delegationFixture) {
+			fx.Exec(t, "UPDATE squad SET archived_at=now() WHERE id=$1", fx.squad)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newDelegationFixture(t)
+			tc.setup(fx)
+			ctx := context.Background()
+			runtime := fx.Runtime(t, "delegation gate runtime")
+			orphan := fx.Task(t, fx.member, testutil.Cols{
+				"runtime_id": runtime, "issue_id": util.UUIDToString(fx.issue.ID), "status": "queued",
+			})
+			squad, err := fx.q.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{ID: parseTestUUID(t, fx.squad), WorkspaceID: fx.issue.WorkspaceID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rule, err := fx.svc.TaskSvc.EnsureDelegationWakeupRule(ctx, fx.issue, squad, parseTestUUID(t, orphan), parseTestUUID(t, fx.UserID), parseTestUUID(t, fx.leaderTask))
+			if err != nil || rule.ID.Valid {
+				t.Fatalf("Ensure = (%v, %v), want the zero rule and no error", util.UUIDToString(rule.ID), err)
+			}
+			// The whole enqueue path stays silent too.
+			fx.delegate(t, "agent", fx.leader, fx.member, fx.leaderTask)
+			if got := fx.ruleCount(t); got != 0 {
+				t.Fatalf("%s armed %d rules, want 0", tc.name, got)
+			}
+		})
+	}
+}
+
+// TestSquadDelegationWakeupJoinsQueuedLeaderRun pins the merged path for the
+// delegation shape: when the member run ends while a queued leader run of the
+// delegation's own originator waits to start, the firing joins that run —
+// judged by the leader and creator the rule names, the same pair dispatch held
+// the inputs for — instead of queuing a second one, and the joined note
+// carries the delegation instruction itself. The issue's creator is another
+// member on purpose: child_done's judgment (who caused the issue to exist)
+// then disagrees with the rule's creator, so a delegation rule that fell into
+// the child_done branch would refuse the join and queue a second leader run.
+func TestSquadDelegationWakeupJoinsQueuedLeaderRun(t *testing.T) {
+	fx := newDelegationFixture(t)
+	creator := fx.principalFixture.member(t, "delegation issue creator")
+	fx.Exec(t, "UPDATE issue SET creator_id=$2 WHERE id=$1", fx.issue.ID, creator)
+	member := fx.delegate(t, "agent", fx.leader, fx.member, fx.leaderTask)
+	rule := fx.rule(t, member.ID)
+	waiting := wakeWaitingRun(t, fx.principalFixture, fx.issue.ID, fx.leader, fx.UserID)
+	fx.Exec(t, "UPDATE agent_task_queue SET status='completed', started_at=now(), completed_at=now() WHERE id=$1", member.ID)
+	fx.tick(t)
+	if n := fx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND context->>'wakeup_id' IS NOT NULL", fx.issue.ID, fx.leader); n != 0 {
+		t.Fatalf("the firing queued %d run(s) of its own beside the waiting leader run", n)
+	}
+	notes := wakeClaim(t, fx.principalFixture, &IssueWakeupService{Tasks: fx.svc.TaskSvc}, waiting)
+	if !strings.Contains(notes, "delegated to a squad member") {
+		t.Fatalf("the claimed leader run lacks the delegation instruction: %q", notes)
+	}
+	wakeStart(t, fx.principalFixture, waiting)
+	fx.tick(t)
+	spent, err := fx.q.GetSystemWakeup(context.Background(), db.GetSystemWakeupParams{IssueID: fx.issue.ID, SystemRule: rule.SystemRule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spent.Enabled || !spent.LastTaskID.Valid || util.UUIDToString(spent.LastTaskID) != waiting {
+		t.Fatalf("once rule after the joined run started: enabled=%v last_task_id=%s", spent.Enabled, util.UUIDToString(spent.LastTaskID))
+	}
+}
+
+// TestSquadDelegationWakeupWakesBesideAPendingRun pins the other side of the
+// scheduling scope: a wakeup run keys on its own rule (migration 516), so a
+// delegation firing is not blocked by an unrelated pending leader run — the
+// leader is woken once, without an error, while that run is still claimed.
+func TestSquadDelegationWakeupWakesBesideAPendingRun(t *testing.T) {
+	fx := newDelegationFixture(t)
+	other := fx.principalFixture.member(t, "delegation other originator")
+	member := fx.delegate(t, "agent", fx.leader, fx.member, fx.leaderTask)
+	rule := fx.rule(t, member.ID)
+	fx.Task(t, fx.leader, testutil.Cols{
+		"runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + fx.leader + "')"),
+		"issue_id":   util.UUIDToString(fx.issue.ID),
+		"status":     "dispatched", "dispatched_at": testutil.Raw("now()"),
+		"originator_user_id": other, "accountable_user_id": other,
+	})
+	fx.Exec(t, "UPDATE agent_task_queue SET status='completed', started_at=now(), completed_at=now() WHERE id=$1", member.ID)
+	fx.tick(t)
+	if n := fx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND agent_id=$2 AND context->>'wakeup_id' IS NOT NULL", fx.issue.ID, fx.leader); n != 1 {
+		t.Fatalf("the leader was woken %d times beside a claimed run, want 1", n)
+	}
+	spent, err := fx.q.GetSystemWakeup(context.Background(), db.GetSystemWakeupParams{IssueID: fx.issue.ID, SystemRule: rule.SystemRule})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spent.Enabled || !spent.LastTaskID.Valid {
+		t.Fatalf("rule after waking beside a claimed run: enabled=%v last_task_id=%s", spent.Enabled, util.UUIDToString(spent.LastTaskID))
+	}
+}
+
+// TestSpentDelegationRulesAreReaped pins the platform's own cleanup: a spent
+// rule whose run is still claimable stays whatever its age, and once nothing
+// references it the rule and its receipts go together.
+func TestSpentDelegationRulesAreReaped(t *testing.T) {
+	fx := newDelegationFixture(t)
+	member := fx.delegate(t, "agent", fx.leader, fx.member, fx.leaderTask)
+	rule := fx.rule(t, member.ID)
+	fx.Exec(t, "UPDATE agent_task_queue SET status='completed', started_at=now(), completed_at=now() WHERE id=$1", member.ID)
+	fx.tick(t)
+	woken := fx.lastTaskOf(t, fx.leader)
+	fx.Exec(t, "UPDATE issue_wakeup SET updated_at=now()-interval '8 days' WHERE id=$1", rule.ID)
+	fx.tick(t)
+	if n := fx.Count(t, "SELECT count(*) FROM issue_wakeup WHERE id=$1", rule.ID); n != 1 {
+		t.Fatal("a spent rule whose run is still claimable was reaped")
+	}
+	fx.Exec(t, "UPDATE agent_task_queue SET status='running', started_at=now() WHERE id=$1", woken)
+	fx.Exec(t, "UPDATE agent_task_queue SET status='completed', completed_at=now() WHERE id=$1", woken)
+	fx.tick(t)
+	if n := fx.Count(t, "SELECT count(*) FROM issue_wakeup WHERE id=$1", rule.ID); n != 0 {
+		t.Fatal("the spent rule survived its reaping window")
+	}
+	if n := fx.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1", rule.ID); n != 0 {
+		t.Fatal("the spent rule's receipts survived it")
 	}
 }

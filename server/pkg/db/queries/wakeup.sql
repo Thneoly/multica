@@ -24,10 +24,13 @@ LEFT JOIN member actor_member ON w.filter_actor_type='member' AND actor_member.u
 LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
 LEFT JOIN agent source ON source.id=w.filter_agent_id AND source.workspace_id=w.workspace_id AND source.id=ANY(@agent_ids::uuid[])
 LEFT JOIN agent_task_queue t ON t.id=w.last_task_id AND t.issue_id=w.issue_id AND t.agent_id=w.agent_id
-WHERE w.workspace_id= @workspace_id AND w.issue_id= @issue_id ORDER BY w.created_at,w.id;
+WHERE w.workspace_id= @workspace_id AND w.issue_id= @issue_id AND w.system_rule IS NULL
+ORDER BY w.created_at,w.id;
 
 -- name: ListWorkspaceWakeupSummaryRows :many
 -- No prompts/history; at most three previews per issue plus exact counts.
+-- Platform rules never appear: they are not subscriptions, and a delegation
+-- rule's agent_id (the leader) would otherwise leak into the counts.
 WITH ranked AS (
  SELECT w.issue_id,w.id,w.agent_id,a.name AS agent_name,w.kind,w.mode,w.event_types,w.filter_actor_type,
  (CASE WHEN actor_agent.id IS NOT NULL OR actor_member.user_id IS NOT NULL THEN w.filter_actor_id END)::uuid AS filter_actor_id,
@@ -45,7 +48,7 @@ WITH ranked AS (
 LEFT JOIN member actor_member ON w.filter_actor_type='member' AND actor_member.user_id=w.filter_actor_id AND actor_member.workspace_id=w.workspace_id
 LEFT JOIN "user" actor_user ON actor_user.id=actor_member.user_id
 LEFT JOIN agent source ON source.id=w.filter_agent_id AND source.workspace_id=w.workspace_id AND source.id=ANY(@agent_ids::uuid[])
- WHERE w.workspace_id= @workspace_id AND w.enabled
+ WHERE w.workspace_id= @workspace_id AND w.enabled AND w.system_rule IS NULL
   AND i.status NOT IN ('done','cancelled')
   AND NOT EXISTS(SELECT 1 FROM issue_status s WHERE s.workspace_id=i.workspace_id AND s.key=i.status AND s.category IN ('done','closed'))
 )
@@ -59,6 +62,12 @@ SELECT * FROM issue_wakeup WHERE id= @id FOR UPDATE;
 SELECT * FROM issue WHERE id= @id FOR NO KEY UPDATE;
 -- name: LockWakeupSourceTask :one
 SELECT * FROM agent_task_queue WHERE id= @id AND issue_id= @issue_id FOR UPDATE NOWAIT;
+-- name: LockWakeupSourceTaskWait :one
+-- The same row as LockWakeupSourceTask, bounded by the caller's lock_timeout
+-- instead of failing at once. The delegation ensure uses it to observe a run
+-- whose terminal write is committing while the rule is being armed: once the
+-- lock is granted, that write is visible, so the snapshot never misses it.
+SELECT * FROM agent_task_queue WHERE id= @id AND issue_id= @issue_id FOR UPDATE;
 -- name: CancelUnstartedWakeupTasks :many
 UPDATE agent_task_queue SET status='cancelled',completed_at=now(),error='Wakeup disabled or updated'
 WHERE context->>'wakeup_id'= @wakeup_id::text AND status IN ('queued','deferred') AND started_at IS NULL RETURNING *;
@@ -105,13 +114,16 @@ ORDER BY w.updated_at,w.id LIMIT @row_limit;
 --                next dispatch, so both are backlog.
 --  own_claimed:  the rule's own run is claimed (FindPendingWakeupTask).
 --  user_waiting: a queued run of the rule's agent, run as its creator, will
---                take them along (hasWaitingRun). Platform rules wait for the
---                issue's current target instead; the caller resolves that.
+--                take them along (hasWaitingRun). Platform rules wait for
+--                their own target instead; the caller resolves that per rule
+--                (a child_done rule waits for the issue's current target, a
+--                delegation rule for the leader and creator it names).
 -- Oldest groups first, one page at a time: the caller pages with the last
 -- group's (oldest, wakeup_id, reserved) until a short page, so no group is
 -- left unread however many there are.
 WITH groups AS (
- SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS system_rule,
+ SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS is_system_rule,
+  w.system_rule, w.agent_id, w.created_by,
   (r.task_id IS NOT NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.id=r.task_id
     AND t.started_at IS NULL AND t.status NOT IN ('running','completed','failed','cancelled')))::bool AS reserved,
   EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')::bool AS own_claimed,
@@ -121,9 +133,10 @@ WITH groups AS (
  FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
  WHERE r.processed_at IS NULL
   AND (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[]))
- GROUP BY 1,2,3,4,5,6
+ GROUP BY 1,2,3,4,5,6,7,8,9
 )
-SELECT g.wakeup_id, g.issue_id, g.system_rule, g.reserved, g.own_claimed, g.user_waiting, g.oldest, g.inputs FROM groups g
+SELECT g.wakeup_id, g.issue_id, g.is_system_rule, g.system_rule, g.agent_id, g.created_by,
+ g.reserved, g.own_claimed, g.user_waiting, g.oldest, g.inputs FROM groups g
 WHERE sqlc.narg('after_oldest')::timestamptz IS NULL
    OR (g.oldest, g.wakeup_id, g.reserved) > (sqlc.narg('after_oldest')::timestamptz, @after_wakeup_id::uuid, @after_reserved::bool)
 ORDER BY g.oldest, g.wakeup_id, g.reserved LIMIT @page_size;
@@ -140,6 +153,24 @@ WITH batch AS MATERIALIZED (
  ORDER BY expired.processed_at,expired.id LIMIT 1000 FOR UPDATE SKIP LOCKED
 )
 DELETE FROM issue_wakeup_receipt r USING batch WHERE r.id=batch.id;
+-- name: DeleteSpentDelegationWakeups :execrows
+-- A delegation rule exists once per delegated run and no user path may delete
+-- a system rule, so the platform removes its own: spent or disabled, with no
+-- input left to deliver and no run left to claim, after the receipts' seven-
+-- day retention. Receipts go with the rule; the runs it created are ordinary
+-- history and stay.
+WITH batch AS MATERIALIZED (
+ SELECT w.id FROM issue_wakeup w
+ WHERE w.system_rule LIKE 'delegation_done:%' AND NOT w.enabled
+  AND NOT EXISTS(SELECT 1 FROM issue_wakeup_receipt r WHERE r.wakeup_id=w.id AND r.processed_at IS NULL)
+  AND NOT EXISTS(SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text
+    AND t.status IN ('queued','deferred','dispatched','running','waiting_local_directory'))
+  AND w.updated_at < @cutoff
+ ORDER BY w.updated_at,w.id LIMIT 100 FOR UPDATE SKIP LOCKED
+), gone AS (
+ DELETE FROM issue_wakeup_receipt r USING batch WHERE r.wakeup_id=batch.id RETURNING r.wakeup_id
+)
+DELETE FROM issue_wakeup w USING batch WHERE w.id=batch.id;
 -- name: RecordWakeupReceipt :one
 INSERT INTO issue_wakeup_receipt(id,wakeup_id,revision,event_key,event_type,payload)
 VALUES(@id,@wakeup_id,@revision,@event_key,@event_type,@payload)

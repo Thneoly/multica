@@ -712,11 +712,16 @@ func (s *IssueWakeupService) tickWith(ctx context.Context, workspaceIDs []pgtype
 	// Receipts are operational evidence, not the run history. Match the existing
 	// event telemetry's seven-day retention; never expire unprocessed inputs.
 	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 2*time.Second)
-	_, cleanupErr := s.Tasks.Queries.DeleteExpiredWakeupReceipts(cleanupCtx, pgtype.Timestamptz{Time: time.Now().Add(-7 * 24 * time.Hour), Valid: true})
+	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-7 * 24 * time.Hour), Valid: true}
+	_, cleanupErr := s.Tasks.Queries.DeleteExpiredWakeupReceipts(cleanupCtx, cutoff)
+	_, spentErr := s.Tasks.Queries.DeleteSpentDelegationWakeups(cleanupCtx, cutoff)
 	cleanupCancel()
 	var errs []error
 	if cleanupErr != nil {
 		errs = append(errs, fmt.Errorf("expire wakeup receipts: %w", cleanupErr))
+	}
+	if spentErr != nil {
+		errs = append(errs, fmt.Errorf("delete spent delegation rules: %w", spentErr))
 	}
 	// claimed holds every rule visited or queued in this pass. Never nil:
 	// "id = ANY(NULL)" is NULL and would exclude every rule.
@@ -894,10 +899,11 @@ func (p pendingInputSummary) age(now time.Time) (time.Duration, bool) {
 }
 
 // pendingInputs classifies every unprocessed input the way dispatch treats
-// it (see ListPendingWakeupInputGroups), paging until the groups run out. For
-// a platform rule an input is held only while a run of the issue's current
-// target agent, run as the person the platform rule's run would run as, waits
-// to start: the same check dispatchSystem makes before keeping its inputs.
+// it (see ListPendingWakeupInputGroups), paging until the groups run out. A
+// platform rule's inputs are held while a run that would take them waits to
+// start: a child_done rule waits for the issue's current target (the same
+// check dispatchSystem makes), a delegation rule for the leader and creator
+// it names (dispatch's hasWaitingRun).
 //
 // On an error, including ctx running out, it returns what it read so far
 // with the error: the summary is then a lower bound, not the answer.
@@ -913,15 +919,22 @@ func (s *IssueWakeupService) pendingInputs(ctx context.Context, workspaceIDs []p
 		}
 		for _, g := range groups {
 			held := g.Reserved || g.OwnClaimed || g.UserWaiting
-			if !held && g.SystemRule {
-				waiting, known := systemWaiting[g.IssueID]
-				if !known {
-					if waiting, err = s.systemRuleRunWaiting(ctx, q, g.IssueID); err != nil {
-						return out, fmt.Errorf("resolve platform rule target: %w", err)
+			if !held && g.IsSystemRule {
+				if isDelegationSystemRule(g.SystemRule.String) {
+					held, err = hasWaitingRun(ctx, q, g.IssueID, g.AgentID, g.CreatedBy)
+					if err != nil {
+						return out, fmt.Errorf("resolve delegation rule target: %w", err)
 					}
-					systemWaiting[g.IssueID] = waiting
+				} else {
+					waiting, known := systemWaiting[g.IssueID]
+					if !known {
+						if waiting, err = s.systemRuleRunWaiting(ctx, q, g.IssueID); err != nil {
+							return out, fmt.Errorf("resolve platform rule target: %w", err)
+						}
+						systemWaiting[g.IssueID] = waiting
+					}
+					held = waiting
 				}
-				held = waiting
 			}
 			switch {
 			case held:
@@ -938,8 +951,9 @@ func (s *IssueWakeupService) pendingInputs(ctx context.Context, workspaceIDs []p
 	}
 }
 
-// systemRuleRunWaiting reports whether a platform rule on the issue would
+// systemRuleRunWaiting reports whether a child_done rule on the issue would
 // keep its inputs for a run waiting to start (dispatchSystem's hasWaitingRun).
+// Delegation rules name their own target and are resolved per rule instead.
 func (s *IssueWakeupService) systemRuleRunWaiting(ctx context.Context, q *db.Queries, issueID pgtype.UUID) (bool, error) {
 	issue, err := q.GetIssue(ctx, issueID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1339,8 +1353,46 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 				squadID = squad.ID
 			}
 		}
-		contextJSON, _ := json.Marshal(map[string]any{"wakeup_id": util.UUIDToString(w.ID), "wakeup_revision": w.Revision, "wakeup_evidence": evidence, "wakeup_chain": chain})
+		// A platform rule served by this dispatcher (a delegation rule) carries
+		// the same run marker dispatchSystem writes, so the claim payload can
+		// tell a platform-started run from a member-registered one.
+		contextValues := map[string]any{"wakeup_id": util.UUIDToString(w.ID), "wakeup_revision": w.Revision, "wakeup_evidence": evidence, "wakeup_chain": chain}
+		if w.SystemRule.Valid {
+			contextValues["wakeup_system"] = w.SystemRule.String
+		}
+		contextJSON, _ := json.Marshal(contextValues)
+		// The insert runs under a savepoint: a unique-violation must not abort
+		// the pass, because the duplicate has its own bounded outcome below.
+		savepoint, spErr := tx.Begin(ctx)
+		if spErr != nil {
+			return spErr
+		}
 		task, err = q.CreateWakeupTask(ctx, db.CreateWakeupTaskParams{ID: dbid.NewV7(), AgentID: w.AgentID, RuntimeID: agent.RuntimeID, IssueID: w.IssueID, Priority: priorityToInt(issue.Priority), TriggerCommentID: w.ParentCommentID, TriggerSummary: pgtype.Text{String: "Wakeup: " + truncateForSummary(w.Instruction, 160), Valid: true}, HandoffNote: pgtype.Text{String: noteText, Valid: true}, IsLeaderTask: pgtype.Bool{Bool: squadID.Valid, Valid: true}, SquadID: squadID, OriginatorUserID: w.CreatedBy, AccountableUserID: w.CreatedBy, OriginatorSource: pgtype.Text{String: "trigger_owner", Valid: true}, TriggerEvidenceKind: pgtype.Text{String: "issue_wakeup", Valid: true}, TriggerEvidenceRefID: w.ID, DelegatedFromTaskID: w.SourceTaskID, WakeupContext: contextJSON, RuntimeMcpOverlay: overlay.Overlay, RuntimeConnectedApps: overlay.ConnectedApps})
+		if err != nil {
+			_ = savepoint.Rollback(ctx)
+			if isDuplicatePendingTaskErr(err) {
+				// A pending run shares this rule's scheduling scope but was not
+				// found above: wakeup runs key the pending-task index on their
+				// own rule (migration 516), so this is one of the rule's own
+				// that FindPendingWakeupTask cannot see — a media-pending
+				// deferral. Like a waiting run, it takes the inputs when it
+				// starts, so they stay instead of failing every pass until it
+				// resumes.
+				if err = q.AdvanceIssueWakeup(ctx, db.AdvanceIssueWakeupParams{ID: w.ID, Enabled: w.Enabled, NextFireAt: next, LastError: pgtype.Text{String: "A pending run of this rule holds its scheduling slot; the inputs wait for it.", Valid: true}}); err != nil {
+					return err
+				}
+				if timedOut {
+					if err = markTimedOut(); err != nil {
+						return err
+					}
+				}
+				return commit()
+			}
+			return err
+		}
+		if err = savepoint.Commit(ctx); err != nil {
+			return err
+		}
 	}
 	if err != nil {
 		return err
