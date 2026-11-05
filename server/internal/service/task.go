@@ -3684,6 +3684,8 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 			return fmt.Errorf("claim task: %w", err)
 		}
 
+
+
 		// An idle task-owned direct-chat row may already be visible as the
 		// positional queue head. Normal completion reanchors a successor beside
 		// the assistant outcome before commit; this claim-time query is the
@@ -3723,6 +3725,21 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 	slog.Info("task claimed", "task_id", util.UUIDToString(claimed.ID), "agent_id", util.UUIDToString(agentID))
 	s.captureTaskDispatched(ctx, *claimed)
 
+	// Direction 5 gate (local research): a claimed task whose issue still has
+	// unmet blocked-by dependencies goes back to queued, in place, with
+	// queue_wait_reason waiting_dependency. Runs in its own short transaction
+	// after the claim commit; nothing external has observed the claim yet.
+	if unmet, gerr := s.unmetDependencyCount(ctx, claimed.IssueID); gerr != nil {
+		outcome = "error_dependency_gate"
+		return nil, attempt, fmt.Errorf("dependency gate: %w", gerr)
+	} else if unmet > 0 {
+		if uerr := s.unclaimForDependency(ctx, claimed.ID); uerr != nil {
+			outcome = "error_dependency_gate"
+			return nil, attempt, fmt.Errorf("dependency unclaim: %w", uerr)
+		}
+		outcome = "no_dependency"
+		return nil, attempt, nil
+	}
 	// Refresh agent status from active tasks. This avoids a stale unconditional
 	// working write racing after a just-cancelled claim.
 	t0 := time.Now()
