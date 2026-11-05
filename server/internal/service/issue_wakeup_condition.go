@@ -579,6 +579,7 @@ type subIssue struct {
 	Stage     pgtype.Int4
 	Closed    bool
 	Cancelled bool
+	Delivered bool
 }
 
 func loadSubIssues(ctx context.Context, tx pgx.Tx, q *db.Queries, parent, workspace pgtype.UUID) ([]subIssue, error) {
@@ -613,6 +614,10 @@ func loadSubIssues(ctx context.Context, tx pgx.Tx, q *db.Queries, parent, worksp
 		}
 		children[i].Closed = category == "done" || category == "closed"
 		children[i].Cancelled = category == "closed"
+		// Delivered: terminal, or delivered for review under the canonical
+		// in_review status; other started statuses (in_progress, blocked,
+		// custom review names) do not count: the review gate is in_review.
+		children[i].Delivered = children[i].Closed || statuses[i] == issuestatus.InReview
 	}
 	return children, nil
 }
@@ -646,6 +651,7 @@ type stageCount struct {
 	Total     int   `json:"total"`
 	Closed    int   `json:"closed"`
 	Cancelled int   `json:"cancelled"`
+	Delivered int   `json:"delivered,omitempty"`
 }
 
 // stageProgress is the system rule's reading. It holds when a stage and every
@@ -657,7 +663,7 @@ func stageProgress(children []subIssue) (bool, string, map[string]any) {
 	counts := map[int32]*stageCount{}
 	var stages []int32
 	unstaged := stageCount{}
-	closed, cancelled := 0, 0
+	closed, cancelled, delivered := 0, 0, 0
 	for _, ch := range children {
 		sc := &unstaged
 		if ch.Stage.Valid {
@@ -676,6 +682,10 @@ func stageProgress(children []subIssue) (bool, string, map[string]any) {
 			sc.Cancelled++
 			cancelled++
 		}
+		if ch.Delivered {
+			sc.Delivered++
+			delivered++
+		}
 	}
 	slices.Sort(stages)
 	list := make([]stageCount, 0, len(stages))
@@ -693,7 +703,7 @@ func stageProgress(children []subIssue) (bool, string, map[string]any) {
 		}
 		closedStage, frontier = stage, true
 	}
-	observed := map[string]any{"total": len(children), "closed": closed, "cancelled": cancelled, "stages": list}
+	observed := map[string]any{"total": len(children), "closed": closed, "cancelled": cancelled, "delivered": delivered, "stages": list}
 	if unstaged.Total > 0 {
 		observed["unstaged"] = unstaged
 	}
@@ -704,6 +714,13 @@ func stageProgress(children []subIssue) (bool, string, map[string]any) {
 	case frontier && waiting:
 		observed["stage"], observed["next_stage"] = closedStage, nextStage
 		return true, fmt.Sprintf("stage:%d", closedStage), observed
+	case waiting && counts[nextStage].Delivered == counts[nextStage].Total:
+		// Delivered tier: the first stage not fully closed is fully
+		// delivered for review. One fingerprint per stage, so it fires
+		// once; the closed tier above keeps priority when a frontier
+		// just closed in the same pass.
+		observed["delivered_stage"] = nextStage
+		return true, fmt.Sprintf("delivered:%d", nextStage), observed
 	}
 	return false, "", observed
 }

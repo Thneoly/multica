@@ -50,6 +50,7 @@ var childDoneCondition = json.RawMessage(`{"type":"children_done","each_stage":t
 const ChildDoneDefaultInstruction = "Sub-issues of this issue have closed; the trigger facts list each stage and which one is next. " +
 	"If a later stage is waiting, check that its dependencies are met, then move its sub-issues out of backlog so they start. " +
 	"If a sub-issue in the closed stages was cancelled rather than finished, decide whether its work is still needed before advancing. " +
+"A stage whose sub-issues are all in review is delivered: the trigger facts mark the delivered stage. Review and accept or reject those sub-issues so the stage can close; leaving them in review stalls the later stages. " +
 	"When every sub-issue is closed, bring their results together on this issue and move it forward, or mark it ready for review when nothing remains."
 
 // SystemWakeupDefault is the rule's workspace default: whether it is on and
